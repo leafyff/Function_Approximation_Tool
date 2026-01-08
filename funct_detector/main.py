@@ -3,18 +3,18 @@ import numpy as np
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QTextEdit, QDialog,
                                QLabel, QLineEdit, QGridLayout, QMessageBox)
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
-import warnings
-
-warnings.filterwarnings('ignore')
+from typing import Optional
 
 from preprocessing import preprocess_stroke, is_function, detect_discontinuities
 from fitting import fit_models, select_best_model
 from latex_gen import model_to_latex
 
+import warnings
+
+warnings.filterwarnings('ignore')
 
 @dataclass
 class PlotSettings:
@@ -135,14 +135,6 @@ class DrawingApp(QMainWindow):
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setXRange(self.settings.x_min, self.settings.x_max)
         self.plot_widget.setYRange(self.settings.y_min, self.settings.y_max)
-
-        x_ticks = np.arange(self.settings.x_min, self.settings.x_max + self.settings.grid_spacing,
-                            self.settings.grid_spacing)
-        y_ticks = np.arange(self.settings.y_min, self.settings.y_max + self.settings.grid_spacing,
-                            self.settings.grid_spacing)
-
-        ax = self.plot_widget.getAxis('bottom')
-        ay = self.plot_widget.getAxis('left')
 
     def mouse_clicked(self, event):
         if event.button() == Qt.LeftButton:
