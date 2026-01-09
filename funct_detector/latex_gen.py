@@ -11,53 +11,54 @@ def model_to_latex(model: FittedModel) -> str:
         coeffs = model.params["coeffs"]
         degree = model.params["degree"]
 
-        expr = sum(sp.Rational(float(coeffs[i])).limit_denominator(10000) * x ** (degree - i)
-                   for i in range(len(coeffs)))
+        terms = [sp.Rational(float(coeffs[i])).limit_denominator(10000) * x ** (degree - i)
+                 for i in range(len(coeffs))]
+        expr = sp.Add(*terms)
         expr = sp.simplify(expr)
 
         latex = sp.latex(expr)
         return f"$f(x) = {latex}$"
 
     elif model.latex_repr == "sinusoidal":
-        A = model.params["A"]
-        f = model.params["f"]
+        a_val = model.params["A"]
+        f_val = model.params["f"]
         phase = model.params["phase"]
-        B = model.params["B"]
+        b_val = model.params["B"]
 
-        A_sym = sp.Rational(float(A)).limit_denominator(10000)
-        f_sym = sp.Rational(float(f)).limit_denominator(10000)
+        a_sym = sp.Rational(float(a_val)).limit_denominator(10000)
+        f_sym = sp.Rational(float(f_val)).limit_denominator(10000)
         phase_sym = sp.Rational(float(phase)).limit_denominator(10000)
-        B_sym = sp.Rational(float(B)).limit_denominator(10000)
+        b_sym = sp.Rational(float(b_val)).limit_denominator(10000)
 
-        expr = A_sym * sp.sin(2 * sp.pi * f_sym * x + phase_sym) + B_sym
+        expr = a_sym * sp.sin(2 * sp.pi * f_sym * x + phase_sym) + b_sym
         expr = sp.simplify(expr)
 
         latex = sp.latex(expr)
         return f"$f(x) = {latex}$"
 
     elif model.latex_repr == "exponential":
-        A = model.params["A"]
-        B = model.params["B"]
-        C = model.params["C"]
+        a_val = model.params["A"]
+        b_val = model.params["B"]
+        c_val = model.params["C"]
 
-        A_sym = sp.Rational(float(A)).limit_denominator(10000)
-        B_sym = sp.Rational(float(B)).limit_denominator(10000)
-        C_sym = sp.Rational(float(C)).limit_denominator(10000)
+        a_sym = sp.Rational(float(a_val)).limit_denominator(10000)
+        b_sym = sp.Rational(float(b_val)).limit_denominator(10000)
+        c_sym = sp.Rational(float(c_val)).limit_denominator(10000)
 
-        expr = A_sym * sp.exp(B_sym * x) + C_sym
+        expr = a_sym * sp.exp(b_sym * x) + c_sym
         expr = sp.simplify(expr)
 
         latex = sp.latex(expr)
         return f"$f(x) = {latex}$"
 
     elif model.latex_repr == "logarithmic":
-        A = model.params["A"]
-        B = model.params["B"]
+        a_val = model.params["A"]
+        b_val = model.params["B"]
 
-        A_sym = sp.Rational(float(A)).limit_denominator(10000)
-        B_sym = sp.Rational(float(B)).limit_denominator(10000)
+        a_sym = sp.Rational(float(a_val)).limit_denominator(10000)
+        b_sym = sp.Rational(float(b_val)).limit_denominator(10000)
 
-        expr = A_sym * sp.ln(x) + B_sym
+        expr = a_sym * sp.ln(x) + b_sym
         expr = sp.simplify(expr)
 
         latex = sp.latex(expr)
@@ -93,6 +94,24 @@ def model_to_latex(model: FittedModel) -> str:
     return "$f(x) = \\text{unknown}$"
 
 
+def _create_polynomial_approximation_latex(x_values: np.ndarray, y_values: np.ndarray,
+                                           note: str = "") -> str:
+    poly_coeffs = np.polyfit(x_values, y_values, min(10, len(x_values) - 1))
+
+    x_sym = sp.Symbol('x')
+    terms = [sp.Rational(float(poly_coeffs[i])).limit_denominator(10000) *
+             x_sym ** (len(poly_coeffs) - 1 - i)
+             for i in range(len(poly_coeffs))]
+    expr = sp.Add(*terms)
+    expr = sp.simplify(expr)
+
+    latex = sp.latex(expr)
+
+    if note:
+        return f"$f(x) \\approx {latex}$ ({note})"
+    return f"$f(x) \\approx {latex}$"
+
+
 def _spline_to_latex_from_cubic(spline: CubicSpline) -> str:
     x_breaks = spline.x
     coeffs = spline.c
@@ -102,16 +121,8 @@ def _spline_to_latex_from_cubic(spline: CubicSpline) -> str:
     if n_segments > 8:
         x_sample = np.linspace(x_breaks[0], x_breaks[-1], 200)
         y_sample = spline(x_sample)
-
-        poly_coeffs = np.polyfit(x_sample, y_sample, min(10, len(x_sample) - 1))
-
-        x_sym = sp.Symbol('x')
-        expr = sum(sp.Rational(float(poly_coeffs[i])).limit_denominator(10000) * x_sym ** (len(poly_coeffs) - 1 - i)
-                   for i in range(len(poly_coeffs)))
-        expr = sp.simplify(expr)
-
-        latex = sp.latex(expr)
-        return f"$f(x) \\approx {latex}$ (simplified from {n_segments} segments)"
+        return _create_polynomial_approximation_latex(x_sample, y_sample,
+                                                      f"simplified from {n_segments} segments")
 
     cases = []
     x_sym = sp.Symbol('x')
@@ -146,19 +157,14 @@ def _spline_to_latex_from_univariate(spline: UnivariateSpline) -> str:
     if len(knots) > 10:
         x_sample = np.linspace(knots[0], knots[-1], 200)
         y_sample = spline(x_sample)
-
-        poly_coeffs = np.polyfit(x_sample, y_sample, min(10, len(x_sample) - 1))
-
-        x_sym = sp.Symbol('x')
-        expr = sum(sp.Rational(float(poly_coeffs[i])).limit_denominator(10000) * x_sym ** (len(poly_coeffs) - 1 - i)
-                   for i in range(len(poly_coeffs)))
-        expr = sp.simplify(expr)
-
-        latex = sp.latex(expr)
-        return f"$f(x) \\approx {latex}$ (simplified from spline)"
+        return _create_polynomial_approximation_latex(x_sample, y_sample,
+                                                      "simplified from spline")
 
     try:
-        tck = spline._eval_args
+        tck = getattr(spline, '_eval_args', None)
+        if tck is None:
+            return f"$f(x) = \\text{{Cubic spline with {len(knots)} knots}}$"
+
         t, c, k = tck
 
         from scipy.interpolate import PPoly
@@ -171,16 +177,8 @@ def _spline_to_latex_from_univariate(spline: UnivariateSpline) -> str:
         if n_segments > 8:
             x_sample = np.linspace(x_breaks[0], x_breaks[-1], 200)
             y_sample = pp(x_sample)
-
-            poly_coeffs = np.polyfit(x_sample, y_sample, min(10, len(x_sample) - 1))
-
-            x_sym = sp.Symbol('x')
-            expr = sum(sp.Rational(float(poly_coeffs[i])).limit_denominator(10000) * x_sym ** (len(poly_coeffs) - 1 - i)
-                       for i in range(len(poly_coeffs)))
-            expr = sp.simplify(expr)
-
-            latex = sp.latex(expr)
-            return f"$f(x) \\approx {latex}$ (simplified from spline)"
+            return _create_polynomial_approximation_latex(x_sample, y_sample,
+                                                          "simplified from spline")
 
         cases = []
         x_sym = sp.Symbol('x')
@@ -191,9 +189,10 @@ def _spline_to_latex_from_univariate(spline: UnivariateSpline) -> str:
 
             poly_coeffs_seg = coeffs[:, i]
 
-            expr = sum(sp.Rational(float(poly_coeffs_seg[j])).limit_denominator(10000) * (x_sym - x_min) ** (
-                        len(poly_coeffs_seg) - 1 - j)
-                       for j in range(len(poly_coeffs_seg)))
+            terms = [sp.Rational(float(poly_coeffs_seg[j])).limit_denominator(10000) *
+                     (x_sym - x_min) ** (len(poly_coeffs_seg) - 1 - j)
+                     for j in range(len(poly_coeffs_seg))]
+            expr = sp.Add(*terms)
 
             expr = sp.expand(expr)
             expr = sp.simplify(expr)
@@ -206,5 +205,5 @@ def _spline_to_latex_from_univariate(spline: UnivariateSpline) -> str:
 
         cases_str = " \\\\\n".join(cases)
         return f"$$f(x) = \\begin{{cases}}\n{cases_str}\n\\end{{cases}}$$"
-    except:
+    except (AttributeError, ValueError, TypeError, IndexError):
         return f"$f(x) = \\text{{Cubic spline with {len(knots)} knots}}$"
