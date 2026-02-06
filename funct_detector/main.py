@@ -3,11 +3,25 @@ import warnings
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QTextEdit, QDialog,
-                               QLabel, QLineEdit, QGridLayout, QMessageBox,
-                               QDoubleSpinBox, QCheckBox, QGroupBox)
+from PySide6.QtCore import Qt, QEvent
+from PySide6.QtGui import QCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QTextEdit,
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QGridLayout,
+    QMessageBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QGroupBox,
+)
 from dataclasses import dataclass
 from typing import Optional
 
@@ -15,7 +29,7 @@ from preprocessing import preprocess_stroke, is_function, detect_discontinuities
 from fitting import fit_models, select_best_model
 from latex_gen import model_to_latex
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 
 @dataclass
@@ -25,7 +39,7 @@ class PlotSettings:
     y_min: float = -10.0
     y_max: float = 10.0
     grid_spacing: float = 1.0
-    accuracy: float = 0.01
+    accuracy: float = 0.0001
 
 
 class SettingsDialog(QDialog):
@@ -42,6 +56,12 @@ class SettingsDialog(QDialog):
         self.y_max_edit = QLineEdit(str(self.settings.y_max))
         self.grid_edit = QLineEdit(str(self.settings.grid_spacing))
 
+        self.accuracy_spinbox = QDoubleSpinBox()
+        self.accuracy_spinbox.setRange(0.0001, 1.0)
+        self.accuracy_spinbox.setSingleStep(0.0001)
+        self.accuracy_spinbox.setDecimals(4)
+        self.accuracy_spinbox.setValue(float(self.settings.accuracy))
+
         layout.addWidget(QLabel("X Min:"), 0, 0)
         layout.addWidget(self.x_min_edit, 0, 1)
         layout.addWidget(QLabel("X Max:"), 1, 0)
@@ -52,6 +72,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.y_max_edit, 3, 1)
         layout.addWidget(QLabel("Grid Spacing:"), 4, 0)
         layout.addWidget(self.grid_edit, 4, 1)
+        layout.addWidget(QLabel("Approximation Accuracy:"), 5, 0)
+        layout.addWidget(self.accuracy_spinbox, 5, 1)
 
         button_layout = QHBoxLayout()
         ok_button = QPushButton("OK")
@@ -61,7 +83,7 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(ok_button)
         button_layout.addWidget(cancel_button)
 
-        layout.addLayout(button_layout, 5, 0, 1, 2)
+        layout.addLayout(button_layout, 6, 0, 1, 2)
         self.setLayout(layout)
 
     def get_settings(self) -> Optional[PlotSettings]:
@@ -72,7 +94,7 @@ class SettingsDialog(QDialog):
                 y_min=float(self.y_min_edit.text()),
                 y_max=float(self.y_max_edit.text()),
                 grid_spacing=float(self.grid_edit.text()),
-                accuracy=self.settings.accuracy
+                accuracy=float(self.accuracy_spinbox.value()),
             )
         except ValueError:
             return None
@@ -93,17 +115,24 @@ class DrawingApp(QMainWindow):
         self.setGeometry(100, 100, 1400, 800)
 
         self.settings = PlotSettings()
+
         self.drawing = False
-        self.points = []
+        self.strokes = []
+        self.current_stroke = None
+
+        self.panning = False
+        self.pan_last_view = None
+
         self.fitted_curves = []
         self.drawn_curve = None
         self.all_models = []
         self.x_proc = None
         self.y_proc = None
+
         self.option_checkboxes = []
+        self.option_widgets = []
 
         self.plot_widget = None
-        self.accuracy_spinbox = None
         self.clear_button = None
         self.fit_button = None
         self.export_button = None
@@ -124,22 +153,6 @@ class DrawingApp(QMainWindow):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.addLegend(offset=(10, 10))
         left_layout.addWidget(self.plot_widget)
-
-        accuracy_layout = QHBoxLayout()
-        accuracy_layout.addWidget(QLabel("Approximation Accuracy:"))
-
-        self.accuracy_spinbox = QDoubleSpinBox()
-        self.accuracy_spinbox.setRange(0.0001, 1.0)
-        self.accuracy_spinbox.setSingleStep(0.001)
-        self.accuracy_spinbox.setDecimals(4)
-        self.accuracy_spinbox.setValue(self.settings.accuracy)
-        self.accuracy_spinbox.valueChanged.connect(self.on_accuracy_changed)
-        accuracy_layout.addWidget(self.accuracy_spinbox)
-
-        accuracy_layout.addWidget(QLabel("(lower = higher quality)"))
-        accuracy_layout.addStretch()
-
-        left_layout.addLayout(accuracy_layout)
 
         button_layout = QHBoxLayout()
         self.clear_button = QPushButton("Clear")
@@ -174,52 +187,22 @@ class DrawingApp(QMainWindow):
 
         main_layout.addLayout(right_layout, 1)
 
-        scene = self.plot_widget.scene()
-        scene.sigMouseClicked.connect(self.mouse_clicked)
-        scene.sigMouseMoved.connect(self.mouse_moved)
+        vb = self.plot_widget.plotItem.vb
+        vb.setMenuEnabled(False)
+        vb.setMouseEnabled(x=False, y=False)
+
+        self.plot_widget.viewport().installEventFilter(self)
 
     def setup_plot(self):
-        self.plot_widget.setLabel('left', 'y')
-        self.plot_widget.setLabel('bottom', 'x')
+        self.plot_widget.setLabel("left", "y")
+        self.plot_widget.setLabel("bottom", "x")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+
+        vb = self.plot_widget.plotItem.vb
+        vb.disableAutoRange()
+
         self.plot_widget.setXRange(self.settings.x_min, self.settings.x_max)
         self.plot_widget.setYRange(self.settings.y_min, self.settings.y_max)
-
-    def on_accuracy_changed(self, value):
-        self.settings.accuracy = max(0.0001, value)
-        if value != self.settings.accuracy:
-            self.accuracy_spinbox.setValue(self.settings.accuracy)
-
-    def mouse_clicked(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.scenePos()
-            if self.plot_widget.sceneBoundingRect().contains(pos):
-                mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
-                if not self.drawing:
-                    self.drawing = True
-                    self.points = [(mouse_point.x(), mouse_point.y())]
-                else:
-                    self.drawing = False
-
-    def mouse_moved(self, pos):
-        if self.drawing:
-            if self.plot_widget.sceneBoundingRect().contains(pos):
-                mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
-                self.points.append((mouse_point.x(), mouse_point.y()))
-                self.update_drawing()
-
-    def update_drawing(self):
-        if self.drawn_curve is not None:
-            self.plot_widget.removeItem(self.drawn_curve)
-
-        if len(self.points) > 1:
-            points_array = np.array(self.points)
-            self.drawn_curve = self.plot_widget.plot(
-                points_array[:, 0],
-                points_array[:, 1],
-                pen=pg.mkPen((100, 100, 255), width=2),
-                name="Drawn curve"
-            )
 
     def clear_fitted_curves(self):
         for curve in self.fitted_curves:
@@ -227,14 +210,19 @@ class DrawingApp(QMainWindow):
         self.fitted_curves = []
 
     def clear_option_checkboxes(self):
-        for checkbox in self.option_checkboxes:
-            checkbox.setParent(None)
-            checkbox.deleteLater()
+        for w in self.option_widgets:
+            w.setParent(None)
+            w.deleteLater()
+        self.option_widgets = []
         self.option_checkboxes = []
 
     def clear_drawing(self):
-        self.points = []
+        self.strokes = []
+        self.current_stroke = None
         self.drawing = False
+        self.panning = False
+        self.pan_last_view = None
+
         if self.drawn_curve is not None:
             self.plot_widget.removeItem(self.drawn_curve)
             self.drawn_curve = None
@@ -249,17 +237,143 @@ class DrawingApp(QMainWindow):
 
         self.plot_widget.clear()
         self.plot_widget.addLegend(offset=(10, 10))
+        self.setup_plot()
 
     def toggle_option(self, index, checked):
-        if index < len(self.fitted_curves):
-            self.fitted_curves[index].setVisible(checked)
+        if 0 <= index < len(self.fitted_curves):
+            curve = self.fitted_curves[index]
+            if curve is not None:
+                curve.setVisible(bool(checked))
+
+    def eventFilter(self, obj, event):
+        if obj is self.plot_widget.viewport():
+            vb = self.plot_widget.plotItem.vb
+
+            if event.type() == QEvent.Type.Wheel:
+                delta = event.angleDelta().y()
+                if delta == 0:
+                    delta = event.pixelDelta().y()
+
+                scene_pos = self.plot_widget.mapToScene(event.position().toPoint())
+                if vb.sceneBoundingRect().contains(scene_pos) and delta != 0:
+                    steps = float(delta) / 120.0
+                    factor = 0.9 ** steps
+                    view_pos = vb.mapSceneToView(scene_pos)
+                    vb.scaleBy((factor, factor), center=view_pos)
+
+                event.accept()
+                return True
+
+            if event.type() == QEvent.Type.MouseButtonPress:
+                scene_pos = self.plot_widget.mapToScene(event.pos())
+                if not vb.sceneBoundingRect().contains(scene_pos):
+                    return False
+
+                if event.button() == Qt.MouseButton.LeftButton:
+                    view_pos = vb.mapSceneToView(scene_pos)
+                    self.drawing = True
+                    self.current_stroke = [(float(view_pos.x()), float(view_pos.y()))]
+                    self.strokes.append(self.current_stroke)
+                    self.update_drawing()
+                    return True
+
+                if event.button() == Qt.MouseButton.RightButton:
+                    if self.drawing:
+                        return False
+                    view_pos = vb.mapSceneToView(scene_pos)
+                    self.panning = True
+                    self.pan_last_view = view_pos
+                    self.plot_widget.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                    return True
+
+                return False
+
+            if event.type() == QEvent.Type.MouseMove:
+                scene_pos = self.plot_widget.mapToScene(event.pos())
+                if not vb.sceneBoundingRect().contains(scene_pos):
+                    return False
+
+                if self.drawing and (event.buttons() & Qt.MouseButton.LeftButton):
+                    view_pos = vb.mapSceneToView(scene_pos)
+                    if self.current_stroke is not None:
+                        self.current_stroke.append((float(view_pos.x()), float(view_pos.y())))
+                        self.update_drawing()
+                    return True
+
+                if self.panning and (event.buttons() & Qt.MouseButton.RightButton):
+                    view_pos = vb.mapSceneToView(scene_pos)
+                    if self.pan_last_view is not None:
+                        dx = float(self.pan_last_view.x() - view_pos.x())
+                        dy = float(self.pan_last_view.y() - view_pos.y())
+                        vb.translateBy(x=dx, y=dy)
+                        self.pan_last_view = view_pos
+                    return True
+
+                return False
+
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.drawing = False
+                    self.current_stroke = None
+                    return True
+
+                if event.button() == Qt.MouseButton.RightButton:
+                    self.panning = False
+                    self.pan_last_view = None
+                    self.plot_widget.viewport().unsetCursor()
+                    return True
+
+                return False
+
+        return super().eventFilter(obj, event)
+
+    def get_all_drawn_points_array(self):
+        pts = []
+        for stroke in self.strokes:
+            pts.extend(stroke)
+        if not pts:
+            return np.empty((0, 2), dtype=float)
+        return np.array(pts, dtype=float)
+
+    def update_drawing(self):
+        xs = []
+        ys = []
+
+        for stroke in self.strokes:
+            if len(stroke) == 0:
+                continue
+            if len(xs) != 0:
+                xs.append(np.nan)
+                ys.append(np.nan)
+            sx, sy = zip(*stroke)
+            xs.extend(sx)
+            ys.extend(sy)
+
+        if len(xs) < 2:
+            if self.drawn_curve is not None:
+                self.plot_widget.removeItem(self.drawn_curve)
+                self.drawn_curve = None
+            return
+
+        x_arr = np.asarray(xs, dtype=float)
+        y_arr = np.asarray(ys, dtype=float)
+
+        if self.drawn_curve is None:
+            self.drawn_curve = self.plot_widget.plot(
+                x_arr,
+                y_arr,
+                pen=pg.mkPen((100, 100, 255), width=2),
+                name="Drawn curve",
+            )
+        else:
+            self.drawn_curve.setData(x_arr, y_arr)
 
     def fit_curve(self):
-        if len(self.points) < 10:
+        points_array = self.get_all_drawn_points_array()
+        if points_array.shape[0] < 10:
             QMessageBox.warning(self, "Insufficient Data", "Draw a longer curve (at least 10 points)")
             return
 
-        points_array = np.array(self.points)
         x_raw = points_array[:, 0]
         y_raw = points_array[:, 1]
 
@@ -299,7 +413,7 @@ class DrawingApp(QMainWindow):
             scores.append(score)
 
         sorted_indices = np.argsort(scores)
-        top_models = [models[i] for i in sorted_indices[:min(5, len(models))]]
+        top_models = [models[i] for i in sorted_indices[: min(5, len(models))]]
 
         self.all_models = top_models
 
@@ -312,7 +426,9 @@ class DrawingApp(QMainWindow):
         for idx, model in enumerate(top_models):
             latex_str = model_to_latex(model)
             marker = "★ BEST FIT" if model == best_model else ""
-            latex_parts.append(f"Option {idx + 1} - {model.name} {marker}\nRMSE: {model.rmse:.6f}\n{latex_str}\n")
+            latex_parts.append(
+                f"Option {idx + 1} - {model.name} {marker}\nRMSE: {model.rmse:.6f}\n{latex_str}\n"
+            )
 
             y_plot = model.evaluate(x_plot)
 
@@ -324,15 +440,28 @@ class DrawingApp(QMainWindow):
                 x_plot,
                 y_plot,
                 pen=pg.mkPen(color, width=pen_width, style=pen_style),
-                name=f"Option {idx + 1}: {model.name}"
+                name=f"Option {idx + 1}: {model.name}",
             )
             self.fitted_curves.append(curve)
 
-            checkbox = QCheckBox(f"Option {idx + 1}: {model.name} {marker}")
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+
+            checkbox = QCheckBox()
             checkbox.setChecked(True)
-            checkbox.setStyleSheet(f"color: rgb{color}; font-weight: bold;")
-            checkbox.stateChanged.connect(lambda state, i=idx: self.toggle_option(i, state == Qt.CheckState.Checked))
-            self.options_layout.addWidget(checkbox)
+            checkbox.toggled.connect(lambda checked, i=idx: self.toggle_option(i, checked))
+
+            label = QLabel(f"Option {idx + 1}: {model.name} {marker}")
+            label.setStyleSheet(f"color: rgb{color}; font-weight: bold;")
+
+            row_layout.addWidget(checkbox)
+            row_layout.addWidget(label)
+            row_layout.addStretch(1)
+
+            self.options_layout.addWidget(row)
+            self.option_widgets.append(row)
             self.option_checkboxes.append(checkbox)
 
         self.latex_output.setPlainText("\n".join(latex_parts))
@@ -349,7 +478,6 @@ class DrawingApp(QMainWindow):
             new_settings = dialog.get_settings()
             if new_settings:
                 self.settings = new_settings
-                self.accuracy_spinbox.setValue(self.settings.accuracy)
                 self.setup_plot()
                 self.clear_drawing()
 
@@ -358,7 +486,7 @@ def run_synthetic_test():
     print("=== Synthetic Test Mode ===\n")
 
     test_functions = [
-        ("Polynomial", lambda x: 2 * x ** 2 - 3 * x + 1, -5, 5),
+        ("Polynomial", lambda x: 2 * x**2 - 3 * x + 1, -5, 5),
         ("Sine", lambda x: 3 * np.sin(0.5 * x) + 1, -10, 10),
         ("Exponential", lambda x: 2 * np.exp(0.3 * x) - 5, -3, 3),
     ]
@@ -403,7 +531,7 @@ def run_synthetic_test():
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == '--test':
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
         run_synthetic_test()
     else:
         app = QApplication(sys.argv)
@@ -412,5 +540,5 @@ def main():
         sys.exit(app.exec())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
