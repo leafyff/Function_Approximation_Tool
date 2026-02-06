@@ -139,6 +139,7 @@ class DrawingApp(QMainWindow):
         self.settings_button = None
         self.options_layout = None
         self.latex_output = None
+        self.clear_on_new_line_checkbox = None
 
         self.setup_ui()
         self.setup_plot()
@@ -178,6 +179,11 @@ class DrawingApp(QMainWindow):
         options_group = QGroupBox("Display Options")
         self.options_layout = QVBoxLayout()
         options_group.setLayout(self.options_layout)
+
+        self.clear_on_new_line_checkbox = QCheckBox("Clear plot on a new line")
+        self.clear_on_new_line_checkbox.setChecked(True)
+        self.options_layout.addWidget(self.clear_on_new_line_checkbox)
+
         right_layout.addWidget(options_group)
 
         right_layout.addWidget(QLabel("LaTeX Output (Top Candidates):"))
@@ -189,7 +195,8 @@ class DrawingApp(QMainWindow):
 
         vb = self.plot_widget.plotItem.vb
         vb.setMenuEnabled(False)
-        vb.setMouseEnabled(x=False, y=False)
+        # Enable mouse wheel zooming
+        vb.setMouseEnabled(x=True, y=True)
 
         self.plot_widget.viewport().installEventFilter(self)
 
@@ -223,6 +230,8 @@ class DrawingApp(QMainWindow):
         self.panning = False
         self.pan_last_view = None
 
+        self.plot_widget.viewport().unsetCursor()
+
         if self.drawn_curve is not None:
             self.plot_widget.removeItem(self.drawn_curve)
             self.drawn_curve = None
@@ -230,78 +239,59 @@ class DrawingApp(QMainWindow):
         self.clear_fitted_curves()
         self.clear_option_checkboxes()
 
+        self.latex_output.clear()
         self.all_models = []
         self.x_proc = None
         self.y_proc = None
-        self.latex_output.clear()
 
-        self.plot_widget.clear()
-        self.plot_widget.addLegend(offset=(10, 10))
-        self.setup_plot()
-
-    def toggle_option(self, index, checked):
-        if 0 <= index < len(self.fitted_curves):
-            curve = self.fitted_curves[index]
-            if curve is not None:
-                curve.setVisible(bool(checked))
+    def toggle_option(self, idx, checked):
+        if 0 <= idx < len(self.fitted_curves):
+            curve = self.fitted_curves[idx]
+            if checked:
+                curve.show()
+            else:
+                curve.hide()
 
     def eventFilter(self, obj, event):
-        if obj is self.plot_widget.viewport():
-            vb = self.plot_widget.plotItem.vb
-
-            if event.type() == QEvent.Type.Wheel:
-                delta = event.angleDelta().y()
-                if delta == 0:
-                    delta = event.pixelDelta().y()
-
-                scene_pos = self.plot_widget.mapToScene(event.position().toPoint())
-                if vb.sceneBoundingRect().contains(scene_pos) and delta != 0:
-                    steps = float(delta) / 120.0
-                    factor = 0.9 ** steps
-                    view_pos = vb.mapSceneToView(scene_pos)
-                    vb.scaleBy((factor, factor), center=view_pos)
-
-                event.accept()
-                return True
-
+        if obj == self.plot_widget.viewport():
             if event.type() == QEvent.Type.MouseButtonPress:
-                scene_pos = self.plot_widget.mapToScene(event.pos())
-                if not vb.sceneBoundingRect().contains(scene_pos):
-                    return False
-
                 if event.button() == Qt.MouseButton.LeftButton:
-                    view_pos = vb.mapSceneToView(scene_pos)
+                    if self.clear_on_new_line_checkbox.isChecked():
+                        # Clear previous drawing and fitted curves when starting a new line
+                        if self.drawn_curve is not None:
+                            self.plot_widget.removeItem(self.drawn_curve)
+                            self.drawn_curve = None
+                        self.clear_fitted_curves()
+                        self.clear_option_checkboxes()
+                        self.latex_output.clear()
+                        self.strokes = []
+
                     self.drawing = True
-                    self.current_stroke = [(float(view_pos.x()), float(view_pos.y()))]
+                    self.current_stroke = []
                     self.strokes.append(self.current_stroke)
+                    view_pos = self.plot_widget.plotItem.vb.mapSceneToView(event.position())
+                    self.current_stroke.append((view_pos.x(), view_pos.y()))
                     self.update_drawing()
                     return True
 
                 if event.button() == Qt.MouseButton.RightButton:
-                    if self.drawing:
-                        return False
-                    view_pos = vb.mapSceneToView(scene_pos)
                     self.panning = True
-                    self.pan_last_view = view_pos
+                    self.pan_last_view = self.plot_widget.plotItem.vb.mapSceneToView(event.position())
                     self.plot_widget.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
                     return True
 
                 return False
 
             if event.type() == QEvent.Type.MouseMove:
-                scene_pos = self.plot_widget.mapToScene(event.pos())
-                if not vb.sceneBoundingRect().contains(scene_pos):
-                    return False
-
-                if self.drawing and (event.buttons() & Qt.MouseButton.LeftButton):
-                    view_pos = vb.mapSceneToView(scene_pos)
-                    if self.current_stroke is not None:
-                        self.current_stroke.append((float(view_pos.x()), float(view_pos.y())))
-                        self.update_drawing()
+                if self.drawing and self.current_stroke is not None:
+                    view_pos = self.plot_widget.plotItem.vb.mapSceneToView(event.position())
+                    self.current_stroke.append((view_pos.x(), view_pos.y()))
+                    self.update_drawing()
                     return True
 
-                if self.panning and (event.buttons() & Qt.MouseButton.RightButton):
-                    view_pos = vb.mapSceneToView(scene_pos)
+                if self.panning and self.pan_last_view is not None:
+                    vb = self.plot_widget.plotItem.vb
+                    view_pos = vb.mapSceneToView(event.position())
                     if self.pan_last_view is not None:
                         dx = float(self.pan_last_view.x() - view_pos.x())
                         dy = float(self.pan_last_view.y() - view_pos.y())
@@ -478,7 +468,6 @@ class DrawingApp(QMainWindow):
             new_settings = dialog.get_settings()
             if new_settings:
                 self.settings = new_settings
-                self.setup_plot()
                 self.clear_drawing()
 
 
