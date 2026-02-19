@@ -65,11 +65,16 @@ EvaluationFunction = Callable[[FloatArray], FloatArray]
 
 # ---------------------------------------------------------------------------
 # Scoring weights: Score = ALPHA*(L_inf/s) + BETA*(RMSE/s) + GAMMA*complexity
+#
+# GAMMA is intentionally small: the dense-reference RMSE already penalises
+# oscillating/overfitting models (their residuals are large on unseen points).
+# GAMMA is only a tiebreaker between models with similar residuals — e.g.
+# preferring a 2-parameter log over an equally-accurate 40-knot spline.
 # ---------------------------------------------------------------------------
 
 ALPHA: float = 0.4
-BETA: float = 0.4
-GAMMA: float = 0.2
+BETA:  float = 0.4
+GAMMA: float = 0.05
 
 # All models shown; only the top N get their checkbox checked ON.
 N_TOP_CHECKED: int = 2
@@ -283,7 +288,7 @@ class ChebyshevPolynomialFitter(ModelFitter):
             rmse=rmse_f,
             l_inf=l_inf_f,
             bic=bic_f,
-            complexity=float(best_degree) * 0.5,
+            complexity=float(best_degree + 1) * 0.5,
             params={
                 "cheb_coef": list(best_fit.coef),   # coefficients in Chebyshev basis
                 "domain": [x_min, x_max],
@@ -386,7 +391,7 @@ class SinusoidalFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=3.0,
+                complexity=2.0,
                 params={"A": sin_a, "f": sin_f, "phase": sin_p, "B": sin_b},
             )
         except (RuntimeError, ValueError, TypeError, FloatingPointError, np.linalg.LinAlgError):
@@ -398,29 +403,66 @@ class SinusoidalFitter(ModelFitter):
 # ===========================================================================
 
 class ExponentialFitter(ModelFitter):
+    """Fits y = A·exp(B·x) + C.
+
+    Accepts data on the *tail* of an exponential (nearly flat) as well as the
+    rising/falling body.  The log-space R² gate is removed; curve_fit is tried
+    with several seeds (including A≈0 for flat data) and _reject_fit is the
+    quality gate.
+    """
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
+            if len(x) < 6:
+                return None
             y_min = float(np.min(y))
             y_range = float(np.ptp(y))
+            y_mean = float(np.mean(y))
+            y_std = float(np.std(y))
             shift = max(0.0, -y_min + 1e-6 * max(1.0, y_range)) if y_min <= 0 else 0.0
 
-            # Log-space linear pre-fit for initial guess
-            y_log = np.log(y + shift)
-            b_init, log_a0, r2_pre = self._linear_prefit(x, y_log)
-            if r2_pre < 0.70:
-                return None
-            a_init = float(np.exp(log_a0))
+            # Primary guess from log-space linear fit (works for true exponentials)
+            try:
+                y_log = np.log(y + shift)
+                if np.all(np.isfinite(y_log)):
+                    b_init, log_a0, _ = self._linear_prefit(x, y_log)
+                    a_init = float(np.exp(log_a0))
+                else:
+                    raise ValueError
+            except (ValueError, FloatingPointError):
+                a_init, b_init = y_std or 0.1, 0.0
 
             def _exp(xv: FloatArray, a: float, b: float, c: float) -> FloatArray:
-                return np.asarray(a * np.exp(b * xv) + c, dtype=np.float64)
+                return np.asarray(a * np.exp(np.clip(b * xv, -500, 500)) + c,
+                                  dtype=np.float64)
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                res = curve_fit(_exp, x, y, p0=[a_init, b_init, 0.0], maxfev=10000)
-            popt = np.asarray(res[0], dtype=np.float64)
-            exp_a, exp_b, exp_c = float(popt[0]), float(popt[1]), float(popt[2])
+            # Multiple seeds: log-space guess + flat/near-zero-amplitude seeds
+            seeds = [
+                [a_init,      b_init, 0.0],
+                [y_std,       0.0,    y_mean],   # flat tail: A≈0 after optimisation
+                [-y_std,      0.0,    y_mean],
+                [a_init,     -abs(b_init), y_min],
+            ]
+            best_rmse = float("inf")
+            best_popt: Optional[FloatArray] = None
+            for p0 in seeds:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        res = curve_fit(_exp, x, y, p0=p0, maxfev=10000)
+                    popt_c = np.asarray(res[0], dtype=np.float64)
+                    yp = _exp(x, *popt_c)
+                    if not np.all(np.isfinite(yp)):
+                        continue
+                    r = self._rmse(y, yp)
+                    if r < best_rmse:
+                        best_rmse, best_popt = r, popt_c
+                except (RuntimeError, ValueError):
+                    continue
 
+            if best_popt is None:
+                return None
+            exp_a, exp_b, exp_c = float(best_popt[0]), float(best_popt[1]), float(best_popt[2])
             y_pred = _exp(x, exp_a, exp_b, exp_c)
             rmse = self._rmse(y, y_pred)
             if self._reject_fit(y, y_pred, rmse, 0.9):
@@ -439,7 +481,7 @@ class ExponentialFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=3.0,
+                complexity=1.5,
                 params={"A": exp_a, "B": exp_b, "C": exp_c},
             )
         except (RuntimeError, ValueError, TypeError, OverflowError,
@@ -452,39 +494,112 @@ class ExponentialFitter(ModelFitter):
 # ===========================================================================
 
 class LogarithmicFitter(ModelFitter):
+    """Fits y = A·ln(x + shift) + B.
+
+    Accepts both the rising body of a log *and* nearly-flat data far from the
+    origin (where ln(x) looks like a constant / very slow rise).  The R²≥0.50
+    gate is removed; shift is searched over multiple candidates and may be
+    optimised as a free parameter; _reject_fit is the quality gate.
+    """
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
+            n = len(x)
+            if n < 6:
+                return None
             x_min = float(np.min(x))
-            shift = max(0.0, -x_min + 1e-6 * max(1.0, float(np.ptp(x)))) if x_min <= 0 else 0.0
-            x_log = np.log(x + shift)
-
-            # Linear pre-fit for initial guess
-            a_init, b_init, r2_pre = self._linear_prefit(x_log, y)
-            if r2_pre < 0.70:
+            x_span = float(np.ptp(x))
+            y_mean = float(np.mean(y))
+            y_std = float(np.std(y))
+            if x_span <= 0:
                 return None
 
-            log_shift = shift
+            # Minimum safe shift: clears the singularity past x_min
+            safe_shift = max(0.0, -x_min + 1e-4 * max(1.0, x_span))
 
-            def _log(xv: FloatArray, a: float, b: float) -> FloatArray:
-                return np.asarray(a * np.log(xv + log_shift) + b, dtype=np.float64)
+            # Search several shift candidates; keep the one with best R²
+            shifts_to_try: list[float] = [safe_shift]
+            for extra in (0.5, 1.0, 2.0, 5.0, 10.0):
+                shifts_to_try.append(safe_shift + extra)
+            if x_min > 0:
+                shifts_to_try.insert(0, 0.0)
+
+            best_r2 = -float("inf")
+            best_init: Optional[tuple[float, float]] = None
+            best_shift = safe_shift
+
+            for sh in shifts_to_try:
+                try:
+                    x_log = np.log(x + sh)
+                    if not np.all(np.isfinite(x_log)):
+                        continue
+                    a, b, r2 = self._linear_prefit(x_log, y)
+                    if r2 > best_r2:
+                        best_r2, best_init, best_shift = r2, (a, b), sh
+                except (ValueError, FloatingPointError):
+                    continue
+
+            sh = best_shift
+            # Flat-tail case: if R² is low, use A≈0 seed (log is nearly constant)
+            if best_init is not None and best_r2 > 0.05:
+                a_init, b_init = best_init
+            else:
+                a_init = y_std if y_std > 0 else 0.1
+                b_init = y_mean
+
+            # Stage 1: optimise A, B with fixed shift
+            def _log_fixed(xv: FloatArray, amp: float, off: float) -> FloatArray:
+                return np.asarray(amp * np.log(xv + sh) + off, dtype=np.float64)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                res = curve_fit(_log, x, y, p0=[a_init, b_init], maxfev=10000)
+                res = curve_fit(_log_fixed, x, y, p0=[a_init, b_init], maxfev=15000)
             popt = np.asarray(res[0], dtype=np.float64)
             log_a, log_b = float(popt[0]), float(popt[1])
+            y_pred = _log_fixed(x, log_a, log_b)
 
-            y_pred = _log(x, log_a, log_b)
+            # Stage 2: also try shift as a free parameter to find the true singularity
+            try:
+                def _log_free(xv: FloatArray, amp: float, off: float, s: float) -> FloatArray:
+                    arg = xv + s
+                    if np.any(arg <= 0):
+                        return np.full_like(xv, np.nan)
+                    return np.asarray(amp * np.log(arg) + off, dtype=np.float64)
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    res2 = curve_fit(
+                        _log_free, x, y,
+                        p0=[a_init, b_init, sh],
+                        bounds=(
+                            [-np.inf, -np.inf, -x_min + 1e-6],
+                            [np.inf,  np.inf,  np.inf],
+                        ),
+                        maxfev=20000,
+                    )
+                popt2 = np.asarray(res2[0], dtype=np.float64)
+                y_pred2 = _log_free(x, *popt2)
+                if np.all(np.isfinite(y_pred2)) and self._rmse(y, y_pred2) < self._rmse(y, y_pred):
+                    log_a, log_b = float(popt2[0]), float(popt2[1])
+                    sh = float(popt2[2])
+                    y_pred = y_pred2
+            except (RuntimeError, ValueError):
+                pass
+
+            if not np.all(np.isfinite(y_pred)):
+                return None
             rmse = self._rmse(y, y_pred)
             if self._reject_fit(y, y_pred, rmse, 0.9):
                 return None
 
-            l_inf = self._l_inf(y, y_pred)
-            bic = self._bic(len(x), max(rmse ** 2, 1e-300), 2)
+            log_shift = sh
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
-                return _log(x_eval, log_a, log_b)
+                return np.asarray(log_a * np.log(x_eval + log_shift) + log_b,
+                                  dtype=np.float64)
+
+            l_inf = self._l_inf(y, y_pred)
+            bic = self._bic(len(x), max(rmse ** 2, 1e-300), 3)
 
             return FittedModel(
                 name="Logarithmic curve",
@@ -493,8 +608,8 @@ class LogarithmicFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=2.5,
-                params={"A": log_a, "B": log_b, "shift": shift},
+                complexity=1.5,
+                params={"A": log_a, "B": log_b, "shift": log_shift},
             )
         except (RuntimeError, ValueError, TypeError, np.linalg.LinAlgError, FloatingPointError):
             return None
@@ -571,7 +686,7 @@ class RationalFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=3.5,
+                complexity=1.5,
                 params={"A": rat_a, "B": rat_b, "D": rat_d},
             )
         except (RuntimeError, ValueError, TypeError, OverflowError,
@@ -585,13 +700,27 @@ class RationalFitter(ModelFitter):
 # ===========================================================================
 
 class ArctanFitter(ModelFitter):
+    """Fits y = A·arctan(B·x + C) + D.
+
+    Accepts both the rising S-curve body *and* nearly-flat data on the
+    asymptotic tail (where arctan approaches ±π/2 and looks constant).
+    The y_std>0 gate in _validate_basic_data is bypassed; a flat-tail seed
+    (A≈0) is added so curve_fit can converge for nearly-constant data.
+    """
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            validation = self._validate_basic_data(x, y, min_points=8)
-            if validation is None:
+            n = len(x)
+            if n < 8:
                 return None
-            n, y_std, x_span = validation
+            x_sorted = np.sort(x)
+            x_span = float(x_sorted[-1] - x_sorted[0])
+            if x_span <= 0:
+                return None
+            y_std = float(np.std(y))
+            y_mean = float(np.mean(y))
+            # amplitude seed: use y_std if meaningful, else a small value
+            a_seed = y_std if y_std > 0 else 0.1
 
             def _atan(xv: FloatArray, a: float, b: float, c: float, d: float) -> FloatArray:
                 return np.asarray(a * np.arctan(b * xv + c) + d, dtype=np.float64)
@@ -601,34 +730,39 @@ class ArctanFitter(ModelFitter):
 
             for b_seed in (1.0 / x_span, 2.0 / x_span, 0.5 / x_span, 1.0):
                 for c_seed in (0.0, np.pi / 4, -np.pi / 4):
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            res = curve_fit(
-                                _atan, x, y,
-                                p0=[y_std, b_seed, c_seed, float(np.mean(y))],
-                                maxfev=10000,
-                            )
-                        popt = np.asarray(res[0], dtype=np.float64)
-                        yp = _atan(x, *popt)
-                        if not np.all(np.isfinite(yp)):
+                    for a_s in (a_seed, -a_seed, 0.01 * a_seed):   # 0.01·a for flat tail
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                res = curve_fit(
+                                    _atan, x, y,
+                                    p0=[a_s, b_seed, c_seed, y_mean],
+                                    maxfev=10000,
+                                )
+                            popt = np.asarray(res[0], dtype=np.float64)
+                            yp = _atan(x, *popt)
+                            if not np.all(np.isfinite(yp)):
+                                continue
+                            r = self._rmse(y, yp)
+                            if r < best_rmse:
+                                best_rmse, best_popt = r, popt
+                        except (RuntimeError, ValueError):
                             continue
-                        r = self._rmse(y, yp)
-                        if r < best_rmse:
-                            best_rmse, best_popt = r, popt
-                    except (RuntimeError, ValueError):
-                        continue
 
             if best_popt is None:
                 return None
 
             at_a, at_b, at_c, at_d = (float(best_popt[k]) for k in range(4))
             y_pred = _atan(x, at_a, at_b, at_c, at_d)
-
-            if not self._validate_fitted_result(y, y_pred, y_std):
+            if not np.all(np.isfinite(y_pred)):
                 return None
 
             rmse = self._rmse(y, y_pred)
+            # Quality gate: allow flat data (y_std≈0) through; only reject if
+            # residuals are large *relative to* the data spread
+            if self._reject_fit(y, y_pred, rmse, 0.9):
+                return None
+
             l_inf = self._l_inf(y, y_pred)
             bic = self._bic(n, max(rmse ** 2, 1e-300), 4)
 
@@ -642,7 +776,7 @@ class ArctanFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=4.0,
+                complexity=2.0,
                 params={"A": at_a, "B": at_b, "C": at_c, "D": at_d},
             )
         except (RuntimeError, ValueError, TypeError, np.linalg.LinAlgError, FloatingPointError):
@@ -654,14 +788,26 @@ class ArctanFitter(ModelFitter):
 # ===========================================================================
 
 class SplineFitter(ModelFitter):
+    """Fits a cubic smoothing spline via scipy.interpolate.UnivariateSpline.
+
+    The smoothing parameter s is set based on the EXPECTED residual tolerance
+    (proportional to accuracy and data scale), NOT on diff(ys) which measures
+    slope changes rather than noise for RDP-simplified knot sequences.
+    """
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         idx = np.argsort(x)
         xs: FloatArray = x[idx]
         ys: FloatArray = y[idx]
+        n = len(xs)
 
-        noise = float(np.std(np.diff(ys)) / np.sqrt(2)) if len(ys) > 1 else 0.1
-        s = len(xs) * noise ** 2 * (float(accuracy) / 0.01)
+        # Smoothing parameter: target residual = accuracy * y_scale
+        # The old formula s = n*noise²*(accuracy/0.01) used diff(ys) as 'noise',
+        # which is WRONG after RDP simplification (diff measures slope, not noise).
+        # New formula: s = n * (tol)² where tol = accuracy * y_scale
+        y_scale = float(np.std(ys)) or 1.0
+        tol = float(accuracy) * y_scale
+        s = float(n) * tol * tol
 
         try:
             spline = UnivariateSpline(xs, ys, s=s, k=3)
@@ -682,10 +828,11 @@ class SplineFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=float(knots) * 0.3,
+                complexity=float(knots) * 0.5,
                 params={"cubic_spline": cs, "x_knots": xs.tolist(), "k_count": knots},
             )
         except (ValueError, TypeError):
+            # Fallback: natural cubic spline (interpolating)
             cs = CubicSpline(xs, ys)
             y_pred = np.asarray(cs(xs), dtype=np.float64)
             rmse = self._rmse(ys, y_pred)
@@ -703,7 +850,7 @@ class SplineFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=float(segs) * 0.3,
+                complexity=float(segs) * 0.5,
                 params={"cubic_spline": cs, "x_knots": xs.tolist(), "k_count": segs},
             )
 
@@ -754,7 +901,7 @@ class AAAFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=float(n_terms) * 0.8,
+                complexity=float(n_terms) * 0.5,
                 params={
                     "support_points": sp_list,
                     "support_values": sv_list,
@@ -962,84 +1109,99 @@ class InterpolationPolynomialFitter(ModelFitter):
 # ===========================================================================
 
 class TangentialFitter(ModelFitter):
-    """Fits y = A * tan(B*x + C) + D.
+    """Fits y = A · tan(B·x + C) + D.
 
-    The tangent function has period π and vertical asymptotes at
-    B*x + C = π/2 + k·π.  We avoid poles in the data range by constraining
-    B to (0, π/x_span) so at most one monotone branch fits the data, and
-    clipping the argument to (−π/2 + ε, π/2 − ε) for numerical safety.
+    B is bounded so that B·x_span < 0.95·π, ensuring no pole of tan falls
+    inside the data domain.  The argument is clipped softly at ±(π/2 - eps)
+    to handle extrapolation gracefully — NO modulo wrapping, which previously
+    caused multi-branch / sawtooth artifacts on the plot.
     """
 
     _EPS: float = 0.05   # margin from ±π/2 for argument clipping
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            validation = self._validate_basic_data(x, y, min_points=8)
-            if validation is None:
+            n = len(x)
+            if n < 8:
                 return None
-            n, y_std, x_span = validation
-
-            # Monotone increasing data is a prerequisite — quick heuristic
             x_s = x[np.argsort(x)]
             y_s = y[np.argsort(x)]
-            monotone_frac = float(np.mean(np.diff(y_s) > 0))
-            if 0.45 < monotone_frac < 0.55:
-                # Neither clearly monotone nor clearly not — try anyway
-                pass
-            if monotone_frac < 0.3 or monotone_frac > 0.7:
-                # Strongly non-monotone — tangent cannot fit well
-                if monotone_frac < 0.3:
-                    return None
+            x_span = float(x_s[-1] - x_s[0])
+            if x_span <= 0:
+                return None
+            y_std = float(np.std(y_s))
+            y_mean = float(np.mean(y_s))
+            a_seed = y_std if y_std > 0 else 0.1
 
             eps = self._EPS
+            # B upper bound: ensures B·x_span < 0.95·π (no pole in domain)
+            b_lo = 0.05 / x_span
+            b_hi = 0.95 * np.pi / x_span
+            half_pi_safe = 0.5 * np.pi - eps
 
             def _tan(xv: FloatArray, a: float, b: float, c: float, d: float) -> FloatArray:
+                """Evaluate A·tan(B·x + C) + D with soft pole clipping.
+
+                No modulo wrapping — the argument is clipped directly to
+                (-π/2 + eps, π/2 - eps).  With b ≤ b_hi this clips only
+                outside the fitted data range (extrapolation guard).
+                """
                 arg = b * xv + c
-                # Soft-clamp to (-π/2+ε, π/2-ε): avoids overflow at poles
-                half_pi = 0.5 * np.pi
-                arg_clipped = np.clip(arg % np.pi - half_pi, -half_pi + eps, half_pi - eps)
-                return np.asarray(a * np.tan(arg_clipped) + d, dtype=np.float64)
+                arg_safe = np.clip(arg, -half_pi_safe, half_pi_safe)
+                return np.asarray(a * np.tan(arg_safe) + d, dtype=np.float64)
 
             best_rmse = float("inf")
             best_popt: Optional[FloatArray] = None
 
-            b_lo = 0.05 / x_span
-            b_hi = 0.95 * np.pi / x_span    # keep < π/x_span so single branch
-
+            # Seed C so that the midpoint of the data maps near 0 (centre of branch)
+            x_mid = float(np.mean(x_s))
             for b_seed in np.linspace(b_lo, b_hi, 5):
-                for c_seed in (0.0, 0.2, -0.2, 0.5 * np.pi * b_seed * float(np.mean(x))):
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            res = curve_fit(
-                                _tan, x_s, y_s,
-                                p0=[y_std, b_seed, c_seed, float(np.mean(y_s))],
-                                maxfev=15000,
-                                bounds=(
-                                    [-np.inf, b_lo, -np.pi / 2, -np.inf],
-                                    [np.inf,  b_hi,  np.pi / 2,  np.inf],
-                                ),
-                            )
-                        popt = np.asarray(res[0], dtype=np.float64)
-                        yp = _tan(x_s, *popt)
-                        if not np.all(np.isfinite(yp)):
+                c_mid = -b_seed * x_mid   # centres the branch at x_mid
+                for c_seed in (c_mid, 0.0, 0.2, -0.2):
+                    for a_s in (a_seed, -a_seed, 0.01 * a_seed):  # flat-tail seed
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                res = curve_fit(
+                                    _tan, x_s, y_s,
+                                    p0=[a_s, b_seed, c_seed, y_mean],
+                                    maxfev=15000,
+                                    bounds=(
+                                        [-np.inf, b_lo, -np.pi / 2, -np.inf],
+                                        [np.inf,  b_hi,  np.pi / 2, np.inf],
+                                    ),
+                                )
+                            popt = np.asarray(res[0], dtype=np.float64)
+
+                            # Reject if a pole B·x + C = π/2 + k·π lands in domain
+                            ta, tb, tc = float(popt[0]), float(popt[1]), float(popt[2])
+                            arg_lo = (tb * float(x_s[0]) + tc)
+                            arg_hi = tb * float(x_s[-1]) + tc
+                            # Map both endpoints to (-π/2, π/2) and check range fits
+                            if abs(arg_lo) >= half_pi_safe or abs(arg_hi) >= half_pi_safe:
+                                continue
+
+                            yp = _tan(x_s, *popt)
+                            if not np.all(np.isfinite(yp)):
+                                continue
+                            r = self._rmse(y_s, yp)
+                            if r < best_rmse:
+                                best_rmse, best_popt = r, popt
+                        except (RuntimeError, ValueError):
                             continue
-                        r = self._rmse(y_s, yp)
-                        if r < best_rmse:
-                            best_rmse, best_popt = r, popt
-                    except (RuntimeError, ValueError):
-                        continue
 
             if best_popt is None:
                 return None
 
             ta, tb, tc, td = (float(best_popt[k]) for k in range(4))
             y_pred = _tan(x_s, ta, tb, tc, td)
-
-            if not self._validate_fitted_result(y_s, y_pred, y_std):
+            if not np.all(np.isfinite(y_pred)):
                 return None
 
             rmse = self._rmse(y_s, y_pred)
+            if self._reject_fit(y_s, y_pred, rmse, 0.9):
+                return None
+
             l_inf = self._l_inf(y_s, y_pred)
             bic = self._bic(n, max(rmse ** 2, 1e-300), 4)
 
@@ -1055,7 +1217,7 @@ class TangentialFitter(ModelFitter):
                 rmse=rmse,
                 l_inf=l_inf,
                 bic=bic,
-                complexity=4.0,
+                complexity=2.0,
                 params={"A": tan_a, "B": tan_b, "C": tan_c, "D": tan_d},
             )
         except (RuntimeError, ValueError, TypeError, OverflowError,
@@ -1118,7 +1280,7 @@ class NUFFTFitter(ModelFitter):
                         continue
                     rmse = self._rmse(y, y_pred)
                     l_inf = self._l_inf(y, y_pred)
-                    complexity = float(N) * 0.4
+                    complexity = float(N) * 0.5
                     score = (ALPHA * l_inf / y_scale + BETA * rmse / y_scale
                              + GAMMA * complexity)
                     if score < best_score:
@@ -1154,7 +1316,7 @@ class NUFFTFitter(ModelFitter):
                 rmse=rmse_f,
                 l_inf=l_inf_f,
                 bic=bic_f,
-                complexity=float(N_fit) * 0.4,
+                complexity=float(N_fit) * 0.5,
                 params={
                     "coeffs": c.tolist(),
                     "N": N_fit,
@@ -1223,17 +1385,74 @@ class ModelSelectionService:
             ArctanFitter(),
         )
 
-    def fit_all_models(self, x: FloatArray, y: FloatArray,
-                       accuracy: float) -> list[Optional[FittedModel]]:
-        """Return one slot per canonical model (None if fitter did not converge)."""
+    def fit_all_models(
+        self,
+        x_fit: FloatArray,
+        y_fit: FloatArray,
+        accuracy: float,
+        x_ref: Optional[FloatArray] = None,
+        y_ref: Optional[FloatArray] = None,
+    ) -> list[Optional[FittedModel]]:
+        """Return one slot per canonical model (None if fitter did not converge).
+
+        Parameters
+        ----------
+        x_fit, y_fit : sparse preprocessed data used for parameter estimation.
+        accuracy     : tolerance passed to each fitter.
+        x_ref, y_ref : optional dense reference signal (no RDP simplification)
+                       used to re-evaluate RMSE / L-inf after fitting.  Passing
+                       this exposes Runge oscillations and other overfitting
+                       artefacts that are invisible when residuals are measured
+                       only at the sparse training knots.  If omitted, fit-point
+                       residuals are used (old behaviour).
+        """
         results: list[Optional[FittedModel]] = []
         for fitter in self._fitters:
             try:
-                results.append(fitter.fit(x, y, accuracy))
+                model = fitter.fit(x_fit, y_fit, accuracy)
+                if model is not None and x_ref is not None:
+                    model = self._rescore_on_reference(model, x_ref, y_ref)
+                results.append(model)
             except (RuntimeError, ValueError, TypeError, OverflowError,
                     np.linalg.LinAlgError, FloatingPointError):
                 results.append(None)
         return results
+
+    @staticmethod
+    def _rescore_on_reference(
+        model: FittedModel,
+        x_ref: FloatArray,
+        y_ref: FloatArray,
+    ) -> FittedModel:
+        """Return a copy of *model* with RMSE and L-inf re-evaluated on the dense reference.
+
+        A spline or polynomial that interpolates sparse training knots perfectly
+        (RMSE ≈ 0 on those knots) will reveal its true Runge oscillation here.
+        A simple parametric model whose shape matches the drawn curve will score
+        as well on the reference as on its own training data.
+        """
+        try:
+            y_pred = np.asarray(model.evaluate(x_ref), dtype=np.float64)
+            if not np.all(np.isfinite(y_pred)):
+                return model
+            rmse = float(np.sqrt(np.mean((y_ref - y_pred) ** 2)))
+            l_inf = float(np.max(np.abs(y_ref - y_pred)))
+            n = len(x_ref)
+            # Keep BIC proportional to complexity; exact k is already encoded in complexity.
+            bic = float(n * np.log(max(rmse ** 2, 1e-300)) + (model.complexity / 0.5) * np.log(n))
+            return FittedModel(
+                name=model.name,
+                evaluate=model.evaluate,
+                latex_kind=model.latex_kind,
+                rmse=rmse,
+                l_inf=l_inf,
+                bic=bic,
+                complexity=model.complexity,
+                params=model.params,
+            )
+        except (ValueError, TypeError, OverflowError, FloatingPointError,
+                np.linalg.LinAlgError):
+            return model
 
     @staticmethod
     def select_best_model(
@@ -1372,12 +1591,17 @@ class LaTeXGenerator:
         return self._expand_cheb_series(cheb_coef, t)
 
     def _sinusoidal(self, model: FittedModel) -> str:
+        """y = A·sin(2π·B·x + C) + D
+
+        Internal storage uses keys: A, f, phase, B (offset)
+        LaTeX displays as:         A, B, C,     D
+        """
         x = sp.Symbol("x")
-        A = self._n(float(model.params["A"]))
-        f = self._n(float(model.params["f"]))
-        ph = self._n(float(model.params["phase"]))
-        B = self._n(float(model.params["B"]))
-        return self._wrap(A * sp.sin(sp.Integer(2) * sp.pi * f * x + ph) + B)
+        A_val = self._n(float(model.params["A"]))          # amplitude → A
+        B_val = self._n(float(model.params["f"]))          # frequency → B (in display)
+        C_val = self._n(float(model.params["phase"]))      # phase → C (in display)
+        D_val = self._n(float(model.params["B"]))          # offset → D (in display)
+        return self._wrap(A_val * sp.sin(sp.Integer(2) * sp.pi * B_val * x + C_val) + D_val)
 
     def _exponential(self, model: FittedModel) -> str:
         x = sp.Symbol("x")
@@ -1387,11 +1611,12 @@ class LaTeXGenerator:
         return self._wrap(A * sp.exp(B * x) + C)
 
     def _logarithmic(self, model: FittedModel) -> str:
+        """y = A·ln(x + C) + B"""
         x = sp.Symbol("x")
         A = self._n(float(model.params["A"]))
         B = self._n(float(model.params["B"]))
-        shift = float(model.params.get("shift", 0.0))
-        arg = x + self._n(shift) if abs(shift) > 1e-9 else x
+        C = float(model.params.get("shift", 0.0))  # shift → C
+        arg = x + self._n(C) if abs(C) > 1e-9 else x
         return self._wrap(A * sp.ln(arg) + B)
 
     def _rational(self, model: FittedModel) -> str:
@@ -1418,6 +1643,10 @@ class LaTeXGenerator:
         return sp.expand(n0 * dx ** 3 + n1 * dx ** 2 + n2 * dx + n3)
 
     def _spline(self, model: FittedModel) -> str:
+        """Generate piecewise cubic polynomial LaTeX for the spline.
+
+        Shows ALL intervals (no sampling) so the user sees the complete formula.
+        """
         cs: Optional[CubicSpline] = model.params.get("cubic_spline")
         x_knots_raw: list[float] = model.params.get("x_knots", [])
 
@@ -1426,9 +1655,7 @@ class LaTeXGenerator:
             return rf"$$f(x) = \text{{Cubic spline ({k} segments)}}$$"
 
         x_knots = np.asarray(x_knots_raw, dtype=np.float64)
-        if len(x_knots) > self._MAX_SPLINE_CASES + 1:
-            sel = np.linspace(0, len(x_knots) - 1, self._MAX_SPLINE_CASES + 1, dtype=int)
-            x_knots = x_knots[sel]
+        # NO LONGER subsampling — show all intervals
 
         x_sym = sp.Symbol("x")
         cases: list[str] = []
@@ -1573,14 +1800,44 @@ class StrokePreprocessor:
         self._domain_width = float(domain_width)
         self._domain_height = float(domain_height)
 
+    # Minimum number of points kept for parameter estimation.
+    # RDP on a very smooth curve can collapse to just 2-5 corners; any polynomial
+    # then fits them perfectly (RMSE ≈ 0) while oscillating wildly in between.
+    _MIN_FIT_PTS: int = 40
+
     def preprocess(self, x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
         n = max(100, int(self._domain_width * 50))
         x, y = self._resample(x, y, n)
         x, y = self._smooth(x, y)
         x, y = self._remove_outliers(x, y)
         if len(x) > 50:
-            x, y = self._simplify(x, y)
+            x_rdp, y_rdp = self._simplify(x, y)
+            # Guard: if RDP collapsed too aggressively (very smooth curve), fall back
+            # to a uniform subsample so fitters always get enough data.
+            if len(x_rdp) < self._MIN_FIT_PTS:
+                step = max(1, len(x) // self._MIN_FIT_PTS)
+                idx = np.arange(0, len(x), step)
+                if idx[-1] != len(x) - 1:
+                    idx = np.append(idx, len(x) - 1)
+                x, y = x[idx], y[idx]
+            else:
+                x, y = x_rdp, y_rdp
         return x, y
+
+    def preprocess_dense(self, x: FloatArray, y: FloatArray, n: int = 300) -> tuple[FloatArray, FloatArray]:
+        """Dense reference signal for honest model scoring (no RDP simplification).
+
+        Fitters receive the *sparse* output of :meth:`preprocess` for parameter
+        estimation.  After fitting, every model is re-evaluated against this
+        dense reference to measure true approximation quality.  This exposes
+        Runge oscillations and other overfitting artefacts that are invisible
+        when residuals are measured only at the sparse training points.
+        """
+        x, y = self._resample(x, y, n)
+        x, y = self._smooth(x, y)
+        x, y = self._remove_outliers(x, y)
+        idx = np.argsort(x)
+        return x[idx], y[idx]
 
     def is_function(self, x: FloatArray, y: FloatArray) -> tuple[bool, str]:
         eps = self._domain_width / 1000.0
@@ -1700,24 +1957,33 @@ class FitWorker(QObject):
 
     def __init__(
         self,
-        x: FloatArray,
-        y: FloatArray,
+        x_fit: FloatArray,
+        y_fit: FloatArray,
         accuracy: float,
         service: ModelSelectionService,
+        x_ref: Optional[FloatArray] = None,
+        y_ref: Optional[FloatArray] = None,
     ) -> None:
         super().__init__()
-        self._x = x.copy()
-        self._y = y.copy()
+        self._x_fit = x_fit.copy()
+        self._y_fit = y_fit.copy()
+        self._x_ref = x_ref.copy() if x_ref is not None else None
+        self._y_ref = y_ref.copy() if y_ref is not None else None
         self._accuracy = accuracy
         self._service = service
 
     def run(self) -> None:
         try:
-            models = self._service.fit_all_models(self._x, self._y, self._accuracy)
+            models = self._service.fit_all_models(
+                self._x_fit, self._y_fit, self._accuracy,
+                x_ref=self._x_ref, y_ref=self._y_ref,
+            )
             if not any(m is not None for m in models):
                 self.error.emit("Could not fit any model to the data.")
                 return
-            best = self._service.select_best_model(models, self._y)
+            # Use the reference y for scale normalisation when available
+            y_for_scale = self._y_ref if self._y_ref is not None else self._y_fit
+            best = self._service.select_best_model(models, y_for_scale)
             self.finished.emit(models, best)
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
@@ -1863,6 +2129,9 @@ class DrawingApp(QMainWindow):
         self._shown_models: list[Optional[FittedModel]] = [None] * len(
             ModelSelectionService.CANONICAL_NAMES
         )
+        self._curve_names: list[str] = [""] * len(
+            ModelSelectionService.CANONICAL_NAMES
+        )
         self._model_latex_rows: list[str] = []
         self._option_checkboxes: list[QCheckBox] = []
         self._option_widgets: list[QWidget] = []
@@ -1882,7 +2151,7 @@ class DrawingApp(QMainWindow):
 
         left = QVBoxLayout()
         self._plot_widget = pg.PlotWidget()
-        self._plot_widget.addLegend(offset=(10, 10))
+        self._legend = self._plot_widget.addLegend(offset=(10, 10))
         left.addWidget(self._plot_widget)
 
         btn_row = QHBoxLayout()
@@ -2079,7 +2348,7 @@ class DrawingApp(QMainWindow):
 
     def _clear_results(self) -> None:
         """Remove fitted plot curves and reset all 12 model rows to disabled state."""
-        # Remove plot curves
+        # Remove plot curves and clear legend
         for c in self._fitted_curves:
             if c is not None:
                 try:
@@ -2087,9 +2356,15 @@ class DrawingApp(QMainWindow):
                 except (RuntimeError, ValueError, AttributeError):
                     # Item may have already been removed or become invalid
                     pass
+
+        # Clear the legend
+        if hasattr(self, '_legend') and self._legend is not None:
+            self._legend.clear()
+
         n_slots = len(ModelSelectionService.CANONICAL_NAMES)
         self._fitted_curves = [None] * n_slots
         self._shown_models = [None] * n_slots
+        self._curve_names = [""] * n_slots
         self._model_latex_rows = [""] * n_slots
 
         # Reset every row to disabled/unchecked appearance
@@ -2113,7 +2388,7 @@ class DrawingApp(QMainWindow):
         self._current_stroke = None
         self._drawing = False
         self._panning = False
-        self._pan_start_pos = None
+        self._pan_start_scene_pos = None
         self._pan_start_range = None
         self._plot_widget.viewport().unsetCursor()
 
@@ -2167,27 +2442,35 @@ class DrawingApp(QMainWindow):
 
         try:
             pre = StrokePreprocessor(self._settings.domain_width, self._settings.domain_height)
+
+            # Dense reference: 300-point smooth resample with NO RDP simplification.
+            # Preserves the true shape of the drawn curve for honest error evaluation.
+            x_ref, y_ref = pre.preprocess_dense(x_raw, y_raw, n=300)
+
+            # Sparse fitting data: full pipeline including RDP.
+            # Used only for parameter estimation inside each fitter.
             x_p, y_p = pre.preprocess(x_raw, y_raw)
             if len(x_p) < 5:
                 QMessageBox.warning(self, "Processing Error",
                                     "Not enough points after preprocessing.")
                 return
-            ok, msg = pre.is_function(x_p, y_p)
-            if not ok:
-                QMessageBox.warning(self, "Not a Function", msg)
-                return
         except (ValueError, TypeError, IndexError) as exc:
             QMessageBox.critical(self, "Preprocessing Error", str(exc))
             return
 
-        self._x_proc = x_p
-        self._y_proc = y_p
+        # Store the dense reference as the "processed" data so the plot range
+        # and y_scale are computed against the true drawn shape.
+        self._x_proc = x_ref
+        self._y_proc = y_ref
         self._fit_btn.setEnabled(False)
         self._status_lbl.setText("Fitting... please wait")
         self._status_lbl.setStyleSheet("color: orange; font-style: italic;")
 
         self._thread = QThread()
-        self._worker = FitWorker(x_p, y_p, self._settings.accuracy, self._model_service)
+        self._worker = FitWorker(
+            x_p, y_p, self._settings.accuracy, self._model_service,
+            x_ref=x_ref, y_ref=y_ref,
+        )
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
@@ -2281,6 +2564,7 @@ class DrawingApp(QMainWindow):
                     )
                     lbl.setText(f"{display_idx + 1}. {canonical_name}  (—)")
                 self._fitted_curves[display_idx] = None
+                self._curve_names[display_idx] = ""
                 self._model_latex_rows[display_idx] = ""
                 continue
 
@@ -2314,16 +2598,25 @@ class DrawingApp(QMainWindow):
                 )
                 style = Qt.PenStyle.SolidLine if is_best else Qt.PenStyle.DashLine
                 width = 3 if is_best else 2
+                # Plot without name to avoid auto-adding to legend
                 curve = self._plot_widget.plot(
                     x_plot, y_plot,
                     pen=pg.mkPen((r, g, b), width=width, style=style),
-                    name=f"{display_idx + 1}. {canonical_name}",
                 )
                 self._fitted_curves[display_idx] = curve
                 curve.setVisible(is_in_top)
+
+                # Store the display name for this curve
+                curve_name = f"{display_idx + 1}. {canonical_name}"
+                self._curve_names[display_idx] = curve_name
+
+                # Manually add to legend only if checked
+                if is_in_top:
+                    self._legend.addItem(curve, curve_name)
             except (ValueError, TypeError, RuntimeError, OverflowError,
                     np.linalg.LinAlgError, FloatingPointError):
                 self._fitted_curves[display_idx] = None
+                self._curve_names[display_idx] = ""
 
         self._refresh_latex_output()
 
@@ -2377,6 +2670,15 @@ class DrawingApp(QMainWindow):
             curve = self._fitted_curves[index]
             if curve is not None:
                 curve.setVisible(checked)
+
+                # Manage legend item
+                curve_name = self._curve_names[index] if index < len(self._curve_names) else ""
+                if checked and curve_name:
+                    # Add to legend when checked
+                    self._legend.addItem(curve, curve_name)
+                elif not checked:
+                    # Remove from legend when unchecked
+                    self._legend.removeItem(curve)
         self._refresh_latex_output()
 
     def copy_latex(self) -> None:
