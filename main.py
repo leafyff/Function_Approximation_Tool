@@ -1,20 +1,22 @@
 """
-Function Drawer and LaTeX Generator — 12 canonical models.
+This program is an interactive mathematical model selection and function approximation tool.
+It fits user-provided data with 12 mathematical models, estimates them using RMSE, L∞ error, BIC, and combined score,
+Selects the best model, and generates a symbolic LaTeX representation of the resulting function.
+It is designed to balance approximation accuracy and model complexity avoiding overfitting
 
-Mathematical methods
---------------------
-1.  Cubic Spline                             scipy.interpolate.CubicSpline
-2.  Interpolation polynomial (Chebyshev)     Chebyshev.fit at CGL nodes
-3.  L-inf minimax polynomial                 scipy.optimize.linprog / HiGHS
-4.  Polynomial Least Squares (Chebyshev)     numpy.polynomial.Chebyshev.fit
-5.  Non-Uniform Fast Fourier Transform       LS trigonometric regression (NUFFT type-1 pseudoinverse)
-6.  AAA Algorithm                            scipy.interpolate.AAA (Nakatsukasa–Sete–Trefethen 2018)
-7.  Exponential curve                        A·exp(B·x) + C
-8.  Logarithmic curve                        A·ln(x+shift) + B
-9.  Rational curve                           A + B/(x−D)
-10. Sinusoidal curve                         A·sin(2π·f·x + φ) + B
-11. Tangential curve                         A·tan(B·x + C) + D
-12. Arctan (S-curve)                         A·arctan(B·x + C) + D
+Mathematical models:
+    1.  Cubic Spline                             scipy.interpolate.CubicSpline
+    2.  Interpolation polynomial (Chebyshev)     Chebyshev.fit at CGL nodes
+    3.  L-inf minimax polynomial                 scipy.optimize.linprog / HiGHS
+    4.  Polynomial Least Squares (Chebyshev)     numpy.polynomial.Chebyshev.fit
+    5.  Non-Uniform Fast Fourier Transform       LS trigonometric regression (NUFFT type-1 pseudoinverse)
+    6.  AAA Algorithm                            scipy.interpolate.AAA (Nakatsukasa–Sete–Trefethen 2018)
+    7.  Exponential curve                        A·exp(B·x) + C
+    8.  Logarithmic curve                        A·ln(x+B) + C
+    9.  Rational curve                           A + B/(x−C)
+    10. Sinusoidal curve                         A·sin(2π·B·x + C) + D
+    11. Tangential curve                         A·tan(B·x + C) + D
+    12. Arctan (S-curve)                         A·arctan(B·x + C) + D
 
 Scoring:  Score = α·L∞/σ + β·RMSE/σ + γ·complexity
 """
@@ -346,14 +348,17 @@ class SinusoidalFitter(ModelFitter):
             best_rmse = float("inf")
             best_popt: Optional[FloatArray] = None
 
-            for phase_guess in (0.0, np.pi / 2, np.pi, -np.pi / 2):
+            # Two quadrature phases cover the full ambiguity; π and -π/2 are
+            # redundant once the optimizer has converged on frequency.
+            # Early exit avoids the remaining seeds when already well-fitted.
+            for phase_guess in (0.0, np.pi / 2):
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         res = curve_fit(
                             _sin, xs, ys,
                             p0=[amp_init, f0, phase_guess, off_init],
-                            maxfev=10000,
+                            maxfev=3000,
                             bounds=(
                                 [-np.inf, f_min * 0.5, -np.pi, -np.inf],
                                 [np.inf, f_max * 2.0, np.pi, np.inf],
@@ -363,6 +368,8 @@ class SinusoidalFitter(ModelFitter):
                     r = self._rmse(ys, _sin(xs, *popt))
                     if r < best_rmse:
                         best_rmse, best_popt = r, popt
+                    if y_std > 0 and best_rmse / y_std < 0.05:
+                        break  # already an excellent fit
                 except (RuntimeError, ValueError):
                     continue
 
@@ -392,7 +399,7 @@ class SinusoidalFitter(ModelFitter):
                 l_inf=l_inf,
                 bic=bic,
                 complexity=2.0,
-                params={"A": sin_a, "f": sin_f, "phase": sin_p, "B": sin_b},
+                params={"A": sin_a, "B": sin_f, "C": sin_p, "D": sin_b},
             )
         except (RuntimeError, ValueError, TypeError, FloatingPointError, np.linalg.LinAlgError):
             return None
@@ -449,7 +456,7 @@ class ExponentialFitter(ModelFitter):
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        res = curve_fit(_exp, x, y, p0=p0, maxfev=10000)
+                        res = curve_fit(_exp, x, y, p0=p0, maxfev=3000)
                     popt_c = np.asarray(res[0], dtype=np.float64)
                     yp = _exp(x, *popt_c)
                     if not np.all(np.isfinite(yp)):
@@ -457,6 +464,8 @@ class ExponentialFitter(ModelFitter):
                     r = self._rmse(y, yp)
                     if r < best_rmse:
                         best_rmse, best_popt = r, popt_c
+                    if y_std > 0 and best_rmse / y_std < 0.05:
+                        break  # already an excellent fit
                 except (RuntimeError, ValueError):
                     continue
 
@@ -490,15 +499,15 @@ class ExponentialFitter(ModelFitter):
 
 
 # ===========================================================================
-# Logarithmic fitter  A*ln(x + shift) + B
+# Logarithmic fitter  A*ln(x + B) + C
 # ===========================================================================
 
 class LogarithmicFitter(ModelFitter):
-    """Fits y = A·ln(x + shift) + B.
+    """Fits y = A·ln(x + B) + C.
 
     Accepts both the rising body of a log *and* nearly-flat data far from the
     origin (where ln(x) looks like a constant / very slow rise).  The R²≥0.50
-    gate is removed; shift is searched over multiple candidates and may be
+    gate is removed; shift B is searched over multiple candidates and may be
     optimised as a free parameter; _reject_fit is the quality gate.
     """
 
@@ -547,44 +556,20 @@ class LogarithmicFitter(ModelFitter):
                 a_init = y_std if y_std > 0 else 0.1
                 b_init = y_mean
 
-            # Stage 1: optimise A, B with fixed shift
+            # Single curve_fit with the best shift found above.
+            # The exhaustive R²-prefit over 6–7 candidate shifts already picks
+            # the near-optimal singularity location; a free-shift second stage
+            # rarely improves the result and is extremely slow on non-log data
+            # because curve_fit runs to maxfev before giving up.
             def _log_fixed(xv: FloatArray, amp: float, off: float) -> FloatArray:
                 return np.asarray(amp * np.log(xv + sh) + off, dtype=np.float64)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                res = curve_fit(_log_fixed, x, y, p0=[a_init, b_init], maxfev=15000)
+                res = curve_fit(_log_fixed, x, y, p0=[a_init, b_init], maxfev=3000)
             popt = np.asarray(res[0], dtype=np.float64)
             log_a, log_b = float(popt[0]), float(popt[1])
             y_pred = _log_fixed(x, log_a, log_b)
-
-            # Stage 2: also try shift as a free parameter to find the true singularity
-            try:
-                def _log_free(xv: FloatArray, amp: float, off: float, s: float) -> FloatArray:
-                    arg = xv + s
-                    if np.any(arg <= 0):
-                        return np.full_like(xv, np.nan)
-                    return np.asarray(amp * np.log(arg) + off, dtype=np.float64)
-
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    res2 = curve_fit(
-                        _log_free, x, y,
-                        p0=[a_init, b_init, sh],
-                        bounds=(
-                            [-np.inf, -np.inf, -x_min + 1e-6],
-                            [np.inf,  np.inf,  np.inf],
-                        ),
-                        maxfev=20000,
-                    )
-                popt2 = np.asarray(res2[0], dtype=np.float64)
-                y_pred2 = _log_free(x, *popt2)
-                if np.all(np.isfinite(y_pred2)) and self._rmse(y, y_pred2) < self._rmse(y, y_pred):
-                    log_a, log_b = float(popt2[0]), float(popt2[1])
-                    sh = float(popt2[2])
-                    y_pred = y_pred2
-            except (RuntimeError, ValueError):
-                pass
 
             if not np.all(np.isfinite(y_pred)):
                 return None
@@ -609,14 +594,14 @@ class LogarithmicFitter(ModelFitter):
                 l_inf=l_inf,
                 bic=bic,
                 complexity=1.5,
-                params={"A": log_a, "B": log_b, "shift": log_shift},
+                params={"A": log_a, "B": log_shift, "C": log_b},
             )
         except (RuntimeError, ValueError, TypeError, np.linalg.LinAlgError, FloatingPointError):
             return None
 
 
 # ===========================================================================
-# Rational fitter  A + B/(x - D)
+# Rational fitter  A + B/(x - C)
 # ===========================================================================
 
 class RationalFitter(ModelFitter):
@@ -649,13 +634,13 @@ class RationalFitter(ModelFitter):
                         res = curve_fit(
                             _rat, x, y,
                             p0=[y_mean, y_std * x_rng, d_cand],
-                            maxfev=10000,
+                            maxfev=3000,
                         )
                     popt = np.asarray(res[0], dtype=np.float64)
-                    d_fit = float(popt[2])
-                    if x_lo < d_fit < x_hi:
+                    c_fit = float(popt[2])
+                    if x_lo < c_fit < x_hi:
                         continue
-                    r = self._rmse(y, _rat(x, float(popt[0]), float(popt[1]), d_fit))
+                    r = self._rmse(y, _rat(x, float(popt[0]), float(popt[1]), c_fit))
                     if r < best_rmse:
                         best_rmse, best_popt = r, popt
                 except (RuntimeError, ValueError):
@@ -664,8 +649,8 @@ class RationalFitter(ModelFitter):
             if best_popt is None:
                 return None
 
-            rat_a, rat_b, rat_d = float(best_popt[0]), float(best_popt[1]), float(best_popt[2])
-            y_pred = _rat(x, rat_a, rat_b, rat_d)
+            rat_a, rat_b, rat_c = float(best_popt[0]), float(best_popt[1]), float(best_popt[2])
+            y_pred = _rat(x, rat_a, rat_b, rat_c)
             if not np.all(np.isfinite(y_pred)):
                 return None
 
@@ -677,7 +662,7 @@ class RationalFitter(ModelFitter):
             bic = self._bic(len(x), max(rmse ** 2, 1e-300), 3)
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
-                return _rat(x_eval, rat_a, rat_b, rat_d)
+                return _rat(x_eval, rat_a, rat_b, rat_c)
 
             return FittedModel(
                 name="Rational curve",
@@ -687,7 +672,7 @@ class RationalFitter(ModelFitter):
                 l_inf=l_inf,
                 bic=bic,
                 complexity=1.5,
-                params={"A": rat_a, "B": rat_b, "D": rat_d},
+                params={"A": rat_a, "B": rat_b, "C": rat_c},
             )
         except (RuntimeError, ValueError, TypeError, OverflowError,
                 np.linalg.LinAlgError, FloatingPointError):
@@ -728,16 +713,24 @@ class ArctanFitter(ModelFitter):
             best_rmse = float("inf")
             best_popt: Optional[FloatArray] = None
 
+            # 4 b-seeds × 2 c-seeds × 2 a-seeds = 16; covers rising/falling S-curves
+            # at slow, medium, fast, and unit steepness.  Early exit once the fit
+            # is excellent (rmse < 5% of data std).
+            found = False
             for b_seed in (1.0 / x_span, 2.0 / x_span, 0.5 / x_span, 1.0):
-                for c_seed in (0.0, np.pi / 4, -np.pi / 4):
-                    for a_s in (a_seed, -a_seed, 0.01 * a_seed):   # 0.01·a for flat tail
+                if found:
+                    break
+                for c_seed in (0.0, np.pi / 4):
+                    if found:
+                        break
+                    for a_s in (a_seed, -a_seed):
                         try:
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
                                 res = curve_fit(
                                     _atan, x, y,
                                     p0=[a_s, b_seed, c_seed, y_mean],
-                                    maxfev=10000,
+                                    maxfev=3000,
                                 )
                             popt = np.asarray(res[0], dtype=np.float64)
                             yp = _atan(x, *popt)
@@ -746,6 +739,9 @@ class ArctanFitter(ModelFitter):
                             r = self._rmse(y, yp)
                             if r < best_rmse:
                                 best_rmse, best_popt = r, popt
+                            if y_std > 0 and best_rmse / y_std < 0.05:
+                                found = True
+                                break
                         except (RuntimeError, ValueError):
                             continue
 
@@ -857,33 +853,143 @@ class SplineFitter(ModelFitter):
 
 # ===========================================================================
 # AAA rational approximation
-# Replaces the hand-rolled Loewner/SVD loop with scipy.interpolate.AAA.
-# The SciPy implementation is the official reference implementation of the
-# Nakatsukasa-Sete-Trefethen (2018) algorithm.
+# Uses scipy.interpolate.AAA (Nakatsukasa–Sete–Trefethen 2018).
+#
+# Root cause of discontinuities (Froissart phenomenon):
+# -------------------------------------------------------
+# The AAA algorithm is designed to approximate *analytically given* functions
+# sampled to machine precision.  When fed raw user-drawn data (which contains
+# measurement noise and mouse-sampling quantisation), AAA tries to interpolate
+# every tiny numerical fluctuation.  This forces it to add many support points
+# whose induced denominator D(x) = Σ wⱼ/(x−zⱼ) develops real zeros inside
+# [x_min, x_max], producing vertical asymptotes ("Froissart doublets") — i.e.
+# discontinuities of the second kind — that are entirely absent in the data.
+#
+# Note that scipy.interpolate.AAA.clean_up() uses a *residue* criterion to
+# detect doublets and does NOT detect these overfitting poles in general.
+# Relaxing rtol only reduces the degree marginally but does NOT reliably
+# eliminate the problem: for noisy data, even degree-4 AAA can have real poles.
+#
+# Guaranteed fix — polynomial-smoother bridge:
+# --------------------------------------------
+# The only way to guarantee that AAA produces a continuous approximant on
+# [x_min, x_max] is to give it INPUT that is itself free of numerical noise.
+# We achieve this in three steps:
+#
+#   1. SMOOTH  Fit a moderate-degree Chebyshev LS polynomial to the raw data.
+#              This acts as a low-pass filter, discarding high-frequency noise
+#              while preserving the visual shape drawn by the user.
+#              The degree is capped at MAX_POLY_DEG to avoid Runge oscillation.
+#
+#   2. RESAMPLE  Evaluate the polynomial at CLEAN Chebyshev–Gauss–Lobatto
+#              nodes.  These are unisolvent for the polynomial and give AAA
+#              the cleanest possible (noise-free) function samples.
+#
+#   3. FIT & VERIFY  Run AAA on the clean samples.  A polynomial evaluated at
+#              CGL nodes is numerically indistinguishable from an analytic
+#              function, so AAA converges without spawning real poles.
+#              Finally, verify continuity on a dense real grid — this is the
+#              *hard guarantee* that prevents any discontinuous fit from being
+#              returned, regardless of edge cases.
 # ===========================================================================
 
 class AAAFitter(ModelFitter):
 
+    # Maximum Chebyshev polynomial degree used for pre-smoothing.
+    # Higher degree → better accuracy but higher Runge risk and more AAA poles.
+    # 14 is the sweet spot for user-drawn curves (same as ChebyshevPolynomialFitter).
+    _MAX_POLY_DEG: int = 14
+
+    # Number of Chebyshev nodes = _NODE_FACTOR * poly_deg.
+    # Must be > poly_deg (unisolvent); 3× gives comfortable oversampling.
+    _NODE_FACTOR: int = 3
+
+    # Continuity verification: sample the fitted rational on this many points.
+    # 2 000 points gives grid spacing ≈ x_span/2000; the smallest Froissart
+    # spike is bounded below by the support-point spacing (~x_span/n_nodes),
+    # so 2000 points reliably catches every real discontinuity while being
+    # ~25× faster than the original 50 000-point grid.
+    _VERIFY_N: int = 2_000
+
+    # A jump larger than this fraction of the data's peak-to-peak range is
+    # classified as a discontinuity.  0.05 = 5% of the data range.
+    _JUMP_THRESHOLD_FRAC: float = 0.05
+
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            if len(x) < 8:
+            n = len(x)
+            if n < 8:
                 return None
 
-            rtol: float = max(1e-13, float(accuracy) * 1e-3)
+            idx = np.argsort(x)
+            xs: FloatArray = x[idx]
+            ys: FloatArray = y[idx]
+
+            x_min = float(xs[0])
+            x_max = float(xs[-1])
+            x_span = x_max - x_min
+            if x_span < 1e-12:
+                return None
+
+            # ------------------------------------------------------------------
+            # Step 1: Chebyshev LS polynomial smoother
+            # ------------------------------------------------------------------
+            poly_deg = min(self._MAX_POLY_DEG, max(3, n // 4))
+            try:
+                cheb_poly = Chebyshev.fit(xs, ys, poly_deg, domain=[x_min, x_max])
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+
+            # ------------------------------------------------------------------
+            # Step 2: Resample at Chebyshev–Gauss–Lobatto nodes
+            # ------------------------------------------------------------------
+            n_nodes = self._NODE_FACTOR * poly_deg
+            k = np.arange(n_nodes)
+            # CGL nodes: cos(π k / (N−1)) mapped to [x_min, x_max], sorted asc.
+            x_cgl = np.sort(
+                0.5 * (x_min + x_max)
+                + 0.5 * x_span * np.cos(np.pi * k / (n_nodes - 1))
+            )
+            y_cgl = np.asarray(cheb_poly(x_cgl), dtype=np.float64)
+
+            if not np.all(np.isfinite(y_cgl)):
+                return None
+
+            # ------------------------------------------------------------------
+            # Step 3: AAA on clean samples
+            # ------------------------------------------------------------------
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                r = AAA(x.tolist(), y.tolist(), rtol=rtol)
+                r = AAA(x_cgl, y_cgl)
 
-            y_pred = np.asarray(r(x.tolist()), dtype=np.float64)
+            # ------------------------------------------------------------------
+            # Step 4: Hard continuity guarantee — evaluate on dense real grid
+            # ------------------------------------------------------------------
+            x_verify = np.linspace(x_min, x_max, self._VERIFY_N)
+            y_verify = np.asarray(r(x_verify), dtype=np.float64)
+
+            if not np.all(np.isfinite(y_verify)):
+                return None
+
+            y_range = float(np.ptp(ys))
+            jump_tol = self._JUMP_THRESHOLD_FRAC * max(y_range, 1e-6)
+            max_jump = float(np.max(np.abs(np.diff(y_verify))))
+            if max_jump > jump_tol:
+                # Discontinuity detected — reject rather than plot a broken curve.
+                return None
+
+            # ------------------------------------------------------------------
+            # Step 5: Compute fit metrics on original (unsmoothed) data
+            # ------------------------------------------------------------------
+            y_pred = np.asarray(r(xs), dtype=np.float64)
             if not np.all(np.isfinite(y_pred)):
                 return None
 
-            rmse = self._rmse(y, y_pred)
-            l_inf = self._l_inf(y, y_pred)
+            rmse = self._rmse(ys, y_pred)
+            l_inf = self._l_inf(ys, y_pred)
             n_terms: int = len(r.support_points)
-            bic = self._bic(len(x), max(rmse ** 2, 1e-300), n_terms * 2)
+            bic = self._bic(n, max(rmse ** 2, 1e-300), n_terms * 2)
 
-            # Store lightweight scalars for LaTeX (not the AAA object itself).
             sp_list = [float(v) for v in r.support_points]
             sv_list = [float(v) for v in r.support_values]
             w_list = [float(v) for v in r.weights]
@@ -909,7 +1015,8 @@ class AAAFitter(ModelFitter):
                     "n_terms": n_terms,
                 },
             )
-        except (ValueError, TypeError, RuntimeError, np.linalg.LinAlgError, FloatingPointError):
+        except (ValueError, TypeError, RuntimeError, np.linalg.LinAlgError,
+                FloatingPointError):
             return None
 
 
@@ -1133,6 +1240,14 @@ class TangentialFitter(ModelFitter):
             y_mean = float(np.mean(y_s))
             a_seed = y_std if y_std > 0 else 0.1
 
+            # Prescreen: tan(Bx+C)+D is strictly monotone on the fitted interval
+            # (by design, no pole lies inside).  Data with more than 2 direction
+            # reversals cannot be a single tan branch — skip the expensive seed
+            # search entirely rather than running 12 curve_fits to convergence.
+            dy = np.diff(y_s)
+            if int(np.sum(np.diff(np.sign(dy)) != 0)) > 2:
+                return None
+
             eps = self._EPS
             # B upper bound: ensures B·x_span < 0.95·π (no pole in domain)
             b_lo = 0.05 / x_span
@@ -1153,19 +1268,26 @@ class TangentialFitter(ModelFitter):
             best_rmse = float("inf")
             best_popt: Optional[FloatArray] = None
 
-            # Seed C so that the midpoint of the data maps near 0 (centre of branch)
+            # 3 b-seeds × 2 c-seeds × 2 a-seeds = 12 total.
+            # The c_mid seed centres the branch at the data midpoint; 0.0 covers
+            # the symmetric case.  Two amplitude signs handle rising/falling.
             x_mid = float(np.mean(x_s))
-            for b_seed in np.linspace(b_lo, b_hi, 5):
+            found = False
+            for b_seed in np.linspace(b_lo, b_hi, 3):
+                if found:
+                    break
                 c_mid = -b_seed * x_mid   # centres the branch at x_mid
-                for c_seed in (c_mid, 0.0, 0.2, -0.2):
-                    for a_s in (a_seed, -a_seed, 0.01 * a_seed):  # flat-tail seed
+                for c_seed in (c_mid, 0.0):
+                    if found:
+                        break
+                    for a_s in (a_seed, -a_seed):
                         try:
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
                                 res = curve_fit(
                                     _tan, x_s, y_s,
                                     p0=[a_s, b_seed, c_seed, y_mean],
-                                    maxfev=15000,
+                                    maxfev=3000,
                                     bounds=(
                                         [-np.inf, b_lo, -np.pi / 2, -np.inf],
                                         [np.inf,  b_hi,  np.pi / 2, np.inf],
@@ -1187,6 +1309,9 @@ class TangentialFitter(ModelFitter):
                             r = self._rmse(y_s, yp)
                             if r < best_rmse:
                                 best_rmse, best_popt = r, popt
+                            if y_std > 0 and best_rmse / y_std < 0.05:
+                                found = True
+                                break
                         except (RuntimeError, ValueError):
                             continue
 
@@ -1593,17 +1718,17 @@ class LaTeXGenerator:
     def _sinusoidal(self, model: FittedModel) -> str:
         """y = A·sin(2π·B·x + C) + D
 
-        Internal storage uses keys: A, f, phase, B (offset)
-        LaTeX displays as:         A, B, C,     D
+        Internal storage keys: A (amplitude), B (frequency), C (phase), D (offset)
         """
         x = sp.Symbol("x")
-        A_val = self._n(float(model.params["A"]))          # amplitude → A
-        B_val = self._n(float(model.params["f"]))          # frequency → B (in display)
-        C_val = self._n(float(model.params["phase"]))      # phase → C (in display)
-        D_val = self._n(float(model.params["B"]))          # offset → D (in display)
+        A_val = self._n(float(model.params["A"]))
+        B_val = self._n(float(model.params["B"]))
+        C_val = self._n(float(model.params["C"]))
+        D_val = self._n(float(model.params["D"]))
         return self._wrap(A_val * sp.sin(sp.Integer(2) * sp.pi * B_val * x + C_val) + D_val)
 
     def _exponential(self, model: FittedModel) -> str:
+        """y = A·exp(B·x) + C"""
         x = sp.Symbol("x")
         A = self._n(float(model.params["A"]))
         B = self._n(float(model.params["B"]))
@@ -1611,20 +1736,21 @@ class LaTeXGenerator:
         return self._wrap(A * sp.exp(B * x) + C)
 
     def _logarithmic(self, model: FittedModel) -> str:
-        """y = A·ln(x + C) + B"""
+        """y = A·ln(x + B) + C"""
         x = sp.Symbol("x")
         A = self._n(float(model.params["A"]))
-        B = self._n(float(model.params["B"]))
-        C = float(model.params.get("shift", 0.0))  # shift → C
-        arg = x + self._n(C) if abs(C) > 1e-9 else x
-        return self._wrap(A * sp.ln(arg) + B)
+        B = float(model.params["B"])   # shift
+        C = self._n(float(model.params["C"]))
+        arg = x + self._n(B) if abs(B) > 1e-9 else x
+        return self._wrap(A * sp.ln(arg) + C)
 
     def _rational(self, model: FittedModel) -> str:
+        """y = A + B/(x - C)"""
         x = sp.Symbol("x")
         A = self._n(float(model.params["A"]))
         B = self._n(float(model.params["B"]))
-        D = self._n(float(model.params["D"]))
-        return self._wrap(A + B / (x - D))
+        C = self._n(float(model.params["C"]))
+        return self._wrap(A + B / (x - C))
 
     def _arctan(self, model: FittedModel) -> str:
         x = sp.Symbol("x")

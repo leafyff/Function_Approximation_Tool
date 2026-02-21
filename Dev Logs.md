@@ -1,5 +1,6 @@
 
-https://github.com/leafyff/funct_detector
+https://github.com/leafyff/Function_Approximation_Tool
+
 
 ### First plan: (09.01.2026)
 
@@ -26,7 +27,7 @@ The following steps have been implemented:
 
 New methods for analyzing functions are now available:
 - Polynomial Approximation (Interpolation) (Chebyshev Basis)
-- Cubic Splines  
+- Cubic Splines 
 - AAA Algorithm (Adaptive Antoulas-Anderson) (Nakatsukasa–Sète–Trefethen)
 - Discrete Minimax via Linear Programming
 - Simple functions: exponential, logarithmic, hyperbolic, sinusoidal, tangentoidal
