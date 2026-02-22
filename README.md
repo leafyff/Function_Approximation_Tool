@@ -1,4 +1,4 @@
-# Funct Detector
+# Funct Approximation Tool
 
 Interactive function drawing and automatic analytical approximation.
 
