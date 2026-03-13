@@ -115,3 +115,10 @@ Function Detector is both:
 - A practical experiment in numerical stability
 
 ---
+
+## License
+
+MIT
+
+Just let me know if this helped you — I'd be really happy to hear it :D
+
