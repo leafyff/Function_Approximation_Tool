@@ -27,7 +27,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, cast
 
 import numpy as np
 import pyqtgraph as pg
@@ -64,6 +64,36 @@ from scipy.signal import lombscargle, savgol_filter
 
 FloatArray = NDArray[np.floating[Any]]
 EvaluationFunction = Callable[[FloatArray], FloatArray]
+
+# ---------------------------------------------------------------------------
+# scipy.interpolate.AAA has no type annotations on its __init__, which causes
+# type checkers to infer x/y as ``int`` and flag every call site.
+# A factory function with the correct signature is the cleanest fix:
+# it owns the typed boundary and delegates to AAA via a cast so the single
+# ``# type: ignore`` is contained here, away from all business logic.
+# ---------------------------------------------------------------------------
+
+def _make_aaa(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    *,
+    rtol: Optional[float] = None,
+    max_terms: int = 100,
+    clean_up: bool = True,
+    clean_up_tol: float = 1e-13,
+) -> AAA:
+    """Typed factory for :class:`scipy.interpolate.AAA`.
+
+    ``AAA.__init__`` carries no type annotations, so checkers infer its
+    positional parameters as ``int`` and flag every call site.  Erasing the
+    array types to ``Any`` at the constructor boundary is the minimal,
+    fully-contained suppression: the public signature of this factory remains
+    ``NDArray[np.float64]``, and no ``# type: ignore`` leaks into business logic.
+    """
+    x_any: Any = x
+    y_any: Any = y
+    return AAA(x_any, y_any, rtol=rtol, max_terms=max_terms,
+               clean_up=clean_up, clean_up_tol=clean_up_tol)
 
 # ---------------------------------------------------------------------------
 # Scoring weights: Score = ALPHA*(L_inf/s) + BETA*(RMSE/s) + GAMMA*complexity
@@ -258,7 +288,7 @@ class ChebyshevPolynomialFitter(ModelFitter):
             try:
                 # Chebyshev.fit: least-squares in Chebyshev basis.
                 # domain=[x_min, x_max] stored on object; c(x) evaluates correctly.
-                c = Chebyshev.fit(x, y, degree, domain=[x_min, x_max])
+                c: Chebyshev = cast(Chebyshev, Chebyshev.fit(x, y, degree, domain=[x_min, x_max]))
                 y_pred = np.asarray(c(x), dtype=np.float64)
                 rmse = self._rmse(y, y_pred)
                 l_inf = self._l_inf(y, y_pred)
@@ -936,7 +966,7 @@ class AAAFitter(ModelFitter):
             # ------------------------------------------------------------------
             poly_deg = min(self._MAX_POLY_DEG, max(3, n // 4))
             try:
-                cheb_poly = Chebyshev.fit(xs, ys, poly_deg, domain=[x_min, x_max])
+                cheb_poly: Chebyshev = cast(Chebyshev, Chebyshev.fit(xs, ys, poly_deg, domain=[x_min, x_max]))
             except (np.linalg.LinAlgError, ValueError):
                 return None
 
@@ -958,9 +988,11 @@ class AAAFitter(ModelFitter):
             # ------------------------------------------------------------------
             # Step 3: AAA on clean samples
             # ------------------------------------------------------------------
+            x_cgl_1d: NDArray[np.float64] = np.asarray(x_cgl, dtype=np.float64).ravel()
+            y_cgl_1d: NDArray[np.float64] = np.asarray(y_cgl, dtype=np.float64).ravel()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                r = AAA(x_cgl, y_cgl)
+                r = _make_aaa(x_cgl_1d, y_cgl_1d)
 
             # ------------------------------------------------------------------
             # Step 4: Hard continuity guarantee — evaluate on dense real grid
@@ -1169,7 +1201,7 @@ class InterpolationPolynomialFitter(ModelFitter):
                 y_cgl = np.asarray(cs_tmp(np.sort(cgl)), dtype=np.float64)
                 cgl_s = np.sort(cgl)
 
-                cheb = Chebyshev.fit(cgl_s, y_cgl, n - 1, domain=[x_min, x_max])
+                cheb: Chebyshev = cast(Chebyshev, Chebyshev.fit(cgl_s, y_cgl, n - 1, domain=[x_min, x_max]))
                 y_pred = np.asarray(cheb(x), dtype=np.float64)
                 if not np.all(np.isfinite(y_pred)):
                     continue
@@ -1462,8 +1494,8 @@ class NUFFTFitter(ModelFitter):
         """
         cols = [np.ones(len(theta), dtype=np.float64)]
         for k in range(1, n + 1):
-            cols.append(np.cos(k * theta))
-            cols.append(np.sin(k * theta))
+            cols.append(np.asarray(np.cos(k * theta), dtype=np.float64).ravel())
+            cols.append(np.asarray(np.sin(k * theta), dtype=np.float64).ravel())
         return np.column_stack(cols)
 
 
