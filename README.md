@@ -1,8 +1,7 @@
 # Funct Approximation Tool
 
 Interactive function drawing and automatic analytical approximation.
-
-**Latest release:** v0.3  
+ 
 **Dev logs:** Available inside the repository
 
 Function Detector is a PySide6 + NumPy + SciPy application that lets you draw a function on a coordinate plane and automatically approximates it using multiple canonical mathematical models.
