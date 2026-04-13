@@ -1,4 +1,4 @@
-# Funct Approximation Tool
+# Function Approximation Tool
 
 Interactive function drawing and automatic analytical approximation.
  
