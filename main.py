@@ -27,6 +27,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, cast
 
 import numpy as np
@@ -35,7 +36,7 @@ import sympy as sp
 from numpy.polynomial import Chebyshev, Polynomial
 from numpy.typing import NDArray
 from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QThread, Signal
-from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
+from PySide6.QtGui import QColor, QCursor, QIcon, QMouseEvent, QPalette, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -2263,6 +2264,7 @@ class DrawingApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Function Drawer — High-Precision LaTeX Engine")
         self.setGeometry(100, 100, 1450, 820)
+        self.setWindowIcon(QIcon(str(Path(__file__).parent / "app.ico")))
 
         self._model_service = ModelSelectionService()
         self._settings = PlotSettings()
@@ -2894,7 +2896,37 @@ class DrawingApp(QMainWindow):
 # ===========================================================================
 
 def main() -> None:
+    pg.setConfigOptions(background="#141414", foreground="#c8c8c8")
+
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    dark = QPalette()
+    dark.setColor(QPalette.ColorRole.Window,          QColor(30,  30,  30 ))
+    dark.setColor(QPalette.ColorRole.WindowText,      QColor(212, 212, 212))
+    dark.setColor(QPalette.ColorRole.Base,            QColor(18,  18,  18 ))
+    dark.setColor(QPalette.ColorRole.AlternateBase,   QColor(38,  38,  38 ))
+    dark.setColor(QPalette.ColorRole.Text,            QColor(212, 212, 212))
+    dark.setColor(QPalette.ColorRole.BrightText,      QColor(255, 255, 255))
+    dark.setColor(QPalette.ColorRole.Button,          QColor(45,  45,  45 ))
+    dark.setColor(QPalette.ColorRole.ButtonText,      QColor(212, 212, 212))
+    dark.setColor(QPalette.ColorRole.ToolTipBase,     QColor(22,  22,  22 ))
+    dark.setColor(QPalette.ColorRole.ToolTipText,     QColor(212, 212, 212))
+    dark.setColor(QPalette.ColorRole.Highlight,       QColor(0,   122, 204))
+    dark.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    dark.setColor(QPalette.ColorRole.Mid,             QColor(38,  38,  38 ))
+    dark.setColor(QPalette.ColorRole.Dark,            QColor(12,  12,  12 ))
+    dark.setColor(QPalette.ColorRole.Shadow,          QColor(0,   0,   0  ))
+    dark.setColor(QPalette.ColorRole.Light,           QColor(60,  60,  60 ))
+
+    disabled = QPalette.ColorGroup.Disabled
+    dark.setColor(disabled, QPalette.ColorRole.WindowText, QColor(100, 100, 100))
+    dark.setColor(disabled, QPalette.ColorRole.Text,       QColor(100, 100, 100))
+    dark.setColor(disabled, QPalette.ColorRole.ButtonText, QColor(100, 100, 100))
+    dark.setColor(disabled, QPalette.ColorRole.Highlight,  QColor(40,  40,  40 ))
+
+    app.setPalette(dark)
+
     window = DrawingApp()
     window.show()
     sys.exit(app.exec())
